@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Teams Repost Manager</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260608-exceptions">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Teams Repost Manager</h1>
+        <p id="sourceLabel" class="muted"></p>
+      </div>
+      <div class="actions">
+        <span id="authStatus" class="status">Checking</span>
+        <a id="loginLink" class="button secondary" href="/auth/login">Sign in</a>
+        <button id="manageExceptionsButton" class="button secondary hidden" type="button">Exceptions</button>
+        <button id="logoutButton" class="button secondary hidden" type="button">Sign out</button>
+        <button id="refreshButton" class="button" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <main>
+      <div id="message" class="message hidden"></div>
+      <section class="post-controls" aria-label="Post navigation">
+        <div id="loadingIndicator" class="loading hidden" role="status" aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Loading posts</span>
+        </div>
+        <div class="pagination">
+          <label for="pageSize">Posts per page</label>
+          <select id="pageSize">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+          </select>
+          <button id="prevPageButton" class="button secondary" type="button" disabled>Previous</button>
+          <span id="pageStatus" class="status">Page 1</span>
+          <button id="nextPageButton" class="button secondary" type="button" disabled>Next</button>
+        </div>
+      </section>
+      <section id="posts" class="post-list" aria-live="polite"></section>
+    </main>
+
+    <template id="postTemplate">
+      <article class="post">
+        <div class="post-header">
+          <div>
+            <h2 class="post-title"></h2>
+            <p class="post-meta"></p>
+          </div>
+          <span class="badge"></span>
+        </div>
+        <p class="preview hidden"></p>
+        <div class="post-body"></div>
+        <div class="link-row"></div>
+        <div class="asset-row attachments"></div>
+        <div class="asset-row images"></div>
+        <ul class="warnings"></ul>
+      </article>
+    </template>
+
+    <dialog id="exceptionsDialog" class="exception-dialog" aria-labelledby="exceptionsHeading">
+      <div class="dialog-header">
+        <h2 id="exceptionsHeading">Exception List</h2>
+        <button id="closeExceptionsButton" class="icon-button" type="button" aria-label="Close exception list">x</button>
+      </div>
+      <div id="exceptionsList" class="exception-list" aria-live="polite"></div>
+      <form id="exceptionForm" class="exception-form">
+        <label for="exceptionEmail">Email address</label>
+        <div class="exception-input-row">
+          <input id="exceptionEmail" type="email" autocomplete="email" placeholder="name@example.com" required>
+          <button class="button secondary" type="submit">Add</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js?v=20260608-exceptions-modal"></script>
+  </body>
+</html>
