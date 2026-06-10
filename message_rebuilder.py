@@ -11,7 +11,10 @@ from teams_url_parser import TeamsMessageLink
 
 
 HOSTED_CONTENT_SRC_RE = re.compile(r"hostedContents/([^/?#]+)/\$value", re.IGNORECASE)
-DISPLAY_IMAGE_SRC_RE = re.compile(r"(?:^|/)api/posts/[^/?#]+/images/(\d+)(?:$|[?#])", re.IGNORECASE)
+DISPLAY_IMAGE_SRC_RE = re.compile(
+    r"(?:^|/)(?:api/posts|api/flows/[^/]+/posts)/[^/?#]+/images/(\d+)(?:$|[?#])",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)

@@ -3,17 +3,17 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>English to Chinese Repost Manager</title>
+    <title>Chinese to English Repost Manager</title>
     <link rel="stylesheet" href="/static/styles.css?v=20260610-exceptions">
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1 id="managerTitle">English to Chinese Repost Manager</h1>
+        <h1 id="managerTitle">Chinese to English Repost Manager</h1>
         <p id="sourceLabel" class="muted"></p>
       </div>
       <div class="actions">
-        <a class="button secondary" href="/reverse">Chinese to English</a>
+        <a class="button secondary" href="/">English to Chinese</a>
         <span id="authStatus" class="status">Checking</span>
         <a id="loginLink" class="button secondary" href="/auth/login">Sign in</a>
         <button id="manageExceptionsButton" class="button secondary hidden" type="button">Exceptions</button>
@@ -79,14 +79,14 @@
 
     <script>
       window.TEAMS_REPOST_MANAGER_CONFIG = {
-        apiBase: "/api/flows/forward",
-        exceptionsPath: "/api/flows/forward/exceptions",
-        pagePath: "/",
-        title: "English to Chinese Repost Manager",
-        exceptionsTitle: "English Exceptions",
-        translationTargetLanguage: "zh-Hans",
-        translationTargetLabel: "Chinese",
-        emptyPostsMessage: "No posts returned from the configured English source channel."
+        apiBase: "/api/flows/reverse",
+        exceptionsPath: "/api/flows/reverse/exceptions",
+        pagePath: "/reverse",
+        title: "Chinese to English Repost Manager",
+        exceptionsTitle: "Chinese Exceptions",
+        translationTargetLanguage: "en",
+        translationTargetLabel: "English",
+        emptyPostsMessage: "No posts returned from the configured Chinese source channel."
       };
     </script>
     <script src="/static/app.js?v=20260610-exceptions"></script>

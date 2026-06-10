@@ -1,0 +1,12 @@
+[Unit]
+Description=Teams Repost automation worker
+After=network-online.target teams-repost.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/teams-repost
+EnvironmentFile=/opt/teams-repost/.env
+ExecStart=/opt/teams-repost/.venv/bin/python -m automation_worker --once
+User=teams-repost
+Group=teams-repost

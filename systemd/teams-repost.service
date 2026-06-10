@@ -1,0 +1,17 @@
+[Unit]
+Description=Teams Repost FastAPI app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/teams-repost
+EnvironmentFile=/opt/teams-repost/.env
+ExecStart=/opt/teams-repost/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+User=teams-repost
+Group=teams-repost
+
+[Install]
+WantedBy=multi-user.target

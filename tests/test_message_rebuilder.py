@@ -118,6 +118,23 @@ class MessageRebuilderTests(unittest.TestCase):
         self.assertIn('src="../hostedContents/1/$value"', rewritten)
         self.assertIn('<a href="https://teams/source">Embedded image 2</a>', rewritten)
 
+    def test_replaces_flow_display_image_refs(self) -> None:
+        rewritten = replace_display_image_refs(
+            '<p><img src="/api/flows/reverse/posts/msg-1/images/1"></p>',
+            [
+                HostedContentUpload(
+                    occurrence=1,
+                    original_id="image-1",
+                    temporary_id="1",
+                    content_type="image/png",
+                    content_bytes=b"png",
+                )
+            ],
+            [],
+        )
+
+        self.assertIn('src="../hostedContents/1/$value"', rewritten)
+
     def test_strips_attachment_placeholders(self) -> None:
         rewritten = strip_attachment_placeholders('<p>before</p><attachment id="file-1"></attachment><p>after</p>')
 

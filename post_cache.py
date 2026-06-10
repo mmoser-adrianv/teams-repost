@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
+from html import unescape
 from pathlib import Path
 from typing import Any
 
@@ -68,10 +70,13 @@ class PostCache:
         offset: int,
         limit: int,
         excluded_author_emails: set[str] | None = None,
+        excluded_body_prefixes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         posts = self.list_posts(source_team_id, source_channel_id)
         if excluded_author_emails:
             posts = [post for post in posts if (post.get("author_email") or "").lower() not in excluded_author_emails]
+        if excluded_body_prefixes:
+            posts = [post for post in posts if not _cached_body_text(post).startswith(excluded_body_prefixes)]
         safe_offset = max(0, offset)
         safe_limit = max(1, limit)
         page = posts[safe_offset : safe_offset + safe_limit]
@@ -155,3 +160,10 @@ def source_key(source_team_id: str, source_channel_id: str) -> str:
 
 def _post_sort_key(post: dict[str, Any]) -> str:
     return str(post.get("created_date_time") or post.get("saved_at") or "")
+
+
+def _cached_body_text(post: dict[str, Any]) -> str:
+    body_html = str(post.get("body_html") or "")
+    body_preview = str(post.get("body_preview") or "")
+    text = re.sub(r"<[^>]+>", " ", body_html) if body_html else body_preview
+    return re.sub(r"[\s\u00a0]+", " ", unescape(text)).strip()

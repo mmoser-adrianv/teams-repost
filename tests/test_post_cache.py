@@ -49,6 +49,32 @@ class PostCacheTests(unittest.TestCase):
         self.assertEqual(page["next_offset"], 2)
         self.assertEqual(page["total"], 3)
 
+    def test_pages_exclude_cached_posts_by_body_prefix(self) -> None:
+        self.cache.upsert_posts(
+            "team-1",
+            "channel-1",
+            [
+                {
+                    "id": "msg-2",
+                    "created_date_time": "2026-06-05T01:00:00Z",
+                    "body_html": "<p>Original English body</p>",
+                    "body_preview": "Original English body",
+                },
+                {
+                    "id": "msg-1",
+                    "created_date_time": "2026-06-04T01:00:00Z",
+                    "body_html": "<p><strong>原文作者：</strong> Chen</p><hr><p>Repost body</p>",
+                    "body_preview": "原文作者： Chen Repost body",
+                },
+            ],
+        )
+
+        page = self.cache.page_posts("team-1", "channel-1", offset=0, limit=10, excluded_body_prefixes=("原文作者：",))
+
+        self.assertEqual([post["id"] for post in page["posts"]], ["msg-2"])
+        self.assertIsNone(page["next_offset"])
+        self.assertEqual(page["total"], 1)
+
     def test_invalid_json_fails_clearly(self) -> None:
         self.cache_path.write_text("{not json", encoding="utf-8")
 

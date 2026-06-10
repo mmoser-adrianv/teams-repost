@@ -6,6 +6,7 @@ import io
 import json
 import re
 import zipfile
+from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
 from typing import Literal
@@ -89,9 +90,25 @@ class ExceptionEmailRequest(BaseModel):
     email: str = Field(..., min_length=1)
 
 
+@dataclass(frozen=True)
+class RepostFlow:
+    name: str
+    source: DestinationChannel
+    destination: DestinationChannel
+    target_language: str
+    translation_target_label: str
+    exception_list_path: Path
+    skipped_body_prefixes: tuple[str, ...] = ()
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/reverse")
+async def reverse_index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "reverse.html")
 
 
 @app.get("/health")
@@ -100,24 +117,26 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/auth/login")
-async def login(request: Request) -> RedirectResponse:
+async def login(request: Request, return_to: str | None = None) -> RedirectResponse:
+    request.session["auth_return_to"] = _safe_auth_return_path(return_to)
     return RedirectResponse(create_login_flow(request, settings))
 
 
 @app.get("/auth/callback")
 async def auth_callback(request: Request) -> RedirectResponse:
     complete_login_flow(request, settings)
-    return RedirectResponse("/")
+    return_to = _safe_auth_return_path(request.session.pop("auth_return_to", None))
+    return RedirectResponse(return_to)
 
 
 @app.get("/auth/status")
 async def status(request: Request) -> dict:
-    return auth_status(request)
+    return auth_status(request, settings)
 
 
 @app.post("/auth/logout")
 async def logout(request: Request) -> dict:
-    return sign_out(request)
+    return sign_out(request, settings)
 
 
 @app.get("/api/posts")
@@ -127,153 +146,138 @@ async def list_posts(
     cursor: str | None = None,
     refresh: bool = True,
 ) -> dict:
-    source = _configured_source()
-    token = get_access_token(request, settings)
-    history = RepostHistory(settings.repost_history_path)
-    cache = PostCache(settings.post_cache_path)
-    exceptions = ExceptionList(settings.exception_list_path)
-    exception_emails = exceptions.email_set()
-    page_size = min(limit, settings.post_list_limit)
-    offset = 0 if refresh else (_decode_posts_cursor(cursor) if cursor else 0)
-    cache_meta = {
-        "last_refreshed_at": cache.source_status(source.team_id, source.channel_id)["last_refreshed_at"],
-        "new_posts_saved": 0,
-        "posts_skipped_by_exception": 0,
-        "partial_refresh": False,
-        "refresh_failed": False,
-        "refresh_error": None,
-    }
+    return await _list_posts_for_flow(
+        _repost_flow("forward"),
+        request,
+        limit,
+        cursor,
+        refresh,
+        image_route_prefix="/api/posts",
+    )
 
-    if refresh:
-        try:
-            async with _graph(token) as graph:
-                cache_meta.update(await _refresh_post_cache(graph, source, cache, exceptions))
-        except GraphAPIError as exc:
-            if not cache.has_posts(source.team_id, source.channel_id):
-                raise HTTPException(status_code=_graph_http_status(exc.status_code), detail=str(exc)) from exc
-            cache_meta.update(cache.source_status(source.team_id, source.channel_id))
-            cache_meta["refresh_failed"] = True
-            cache_meta["refresh_error"] = str(exc)
 
-    page = cache.page_posts(source.team_id, source.channel_id, offset, page_size, exception_emails)
-    return {
-        "source": {"team_id": source.team_id, "channel_id": source.channel_id},
-        "posts": [_with_repost_status(post, source, history, settings.openai_translation_target) for post in page["posts"]],
-        "pagination": {
-            "limit": page_size,
-            "next_cursor": _encode_posts_cursor(page["next_offset"]) if page["next_offset"] is not None else None,
-            "has_next": page["next_offset"] is not None,
-        },
-        "cache": cache_meta,
-        "exceptions": {"emails": sorted(exception_emails)},
-    }
+@app.get("/api/flows/{flow_name}/posts")
+async def list_flow_posts(
+    flow_name: str,
+    request: Request,
+    limit: int = Query(default=10, ge=1, le=50),
+    cursor: str | None = None,
+    refresh: bool = True,
+) -> dict:
+    flow = _repost_flow(flow_name)
+    return await _list_posts_for_flow(
+        flow,
+        request,
+        limit,
+        cursor,
+        refresh,
+        image_route_prefix=f"/api/flows/{flow.name}/posts",
+    )
 
 
 @app.get("/api/exceptions")
 async def list_exceptions(request: Request) -> dict:
-    get_access_token(request, settings)
-    return {"emails": ExceptionList(settings.exception_list_path).list_emails()}
+    return _list_exceptions_for_flow(_repost_flow("forward"), request)
 
 
 @app.post("/api/exceptions")
 async def add_exception(payload: ExceptionEmailRequest, request: Request) -> dict:
-    get_access_token(request, settings)
-    try:
-        emails = ExceptionList(settings.exception_list_path).add(payload.email)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"emails": emails}
+    return _add_exception_for_flow(_repost_flow("forward"), payload, request)
 
 
 @app.delete("/api/exceptions/{email}")
 async def remove_exception(email: str, request: Request) -> dict:
+    return _remove_exception_for_flow(_repost_flow("forward"), email, request)
+
+
+@app.get("/api/flows/{flow_name}/exceptions")
+async def list_flow_exceptions(flow_name: str, request: Request) -> dict:
+    return _list_exceptions_for_flow(_repost_flow(flow_name), request)
+
+
+@app.post("/api/flows/{flow_name}/exceptions")
+async def add_flow_exception(flow_name: str, payload: ExceptionEmailRequest, request: Request) -> dict:
+    return _add_exception_for_flow(_repost_flow(flow_name), payload, request)
+
+
+@app.delete("/api/flows/{flow_name}/exceptions/{email}")
+async def remove_flow_exception(flow_name: str, email: str, request: Request) -> dict:
+    return _remove_exception_for_flow(_repost_flow(flow_name), email, request)
+
+
+def _list_exceptions_for_flow(flow: RepostFlow, request: Request) -> dict:
+    get_access_token(request, settings)
+    return {"flow": {"name": flow.name}, "emails": ExceptionList(flow.exception_list_path).list_emails()}
+
+
+def _add_exception_for_flow(flow: RepostFlow, payload: ExceptionEmailRequest, request: Request) -> dict:
     get_access_token(request, settings)
     try:
-        emails = ExceptionList(settings.exception_list_path).remove(email)
+        emails = ExceptionList(flow.exception_list_path).add(payload.email)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"emails": emails}
+    return {"flow": {"name": flow.name}, "emails": emails}
+
+
+def _remove_exception_for_flow(flow: RepostFlow, email: str, request: Request) -> dict:
+    get_access_token(request, settings)
+    try:
+        emails = ExceptionList(flow.exception_list_path).remove(email)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"flow": {"name": flow.name}, "emails": emails}
 
 
 @app.post("/api/reposts")
 async def create_repost(payload: CreateRepostRequest, request: Request) -> dict:
-    source = _configured_source()
-    destination = _configured_destination()
-    history = RepostHistory(settings.repost_history_path)
-    target_language = payload.target_language or settings.openai_translation_target
-    existing = history.get(source.team_id, source.channel_id, payload.source_message_id, target_language)
-    if existing:
-        return {"status": "already_reposted", "record": existing}
+    return await _create_repost_for_flow(_repost_flow("forward"), payload, request)
 
-    token = get_access_token(request, settings)
-    cache = PostCache(settings.post_cache_path)
-    cached_post = cache.get_post(source.team_id, source.channel_id, payload.source_message_id)
-    if cached_post is None:
-        raise HTTPException(status_code=404, detail="Cached post was not found")
-    translation = (cached_post.get("translations") or {}).get(target_language)
-    if translation is None:
-        raise HTTPException(status_code=409, detail=f"Translate this post to {target_language} before reposting")
 
-    parsed_source = TeamsMessageLink(
-        tenant_id=None,
-        team_id=source.team_id,
-        source_channel_thread_id=source.channel_id,
-        message_id=payload.source_message_id,
-        parent_message_id=None,
-    )
-    async with _graph(token) as graph:
-        try:
-            report = await repost_translated_message(parsed_source, destination, graph, settings, translation, target_language)
-        except AttachmentRepostError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except GraphAPIError as exc:
-            raise HTTPException(status_code=_graph_http_status(exc.status_code), detail=str(exc)) from exc
-
-    record = build_repost_record(source.team_id, source.channel_id, destination.team_id, destination.channel_id, report, target_language)
-    history.upsert(record)
-    return {"status": "reposted", "record": record, "report": report}
+@app.post("/api/flows/{flow_name}/reposts")
+async def create_flow_repost(flow_name: str, payload: CreateRepostRequest, request: Request) -> dict:
+    return await _create_repost_for_flow(_repost_flow(flow_name), payload, request)
 
 
 @app.post("/api/reposts/manual")
 async def mark_repost_manually(payload: ManualRepostRequest, request: Request) -> dict:
-    source = _configured_source()
-    destination = _configured_destination()
-    target_language = payload.target_language or settings.openai_translation_target
-    get_access_token(request, settings)
+    return await _mark_repost_manually_for_flow(_repost_flow("forward"), payload, request)
 
-    history = RepostHistory(settings.repost_history_path)
-    existing = history.get(source.team_id, source.channel_id, payload.source_message_id, target_language)
-    if existing:
-        return {"status": "already_reposted", "record": existing}
 
-    cache = PostCache(settings.post_cache_path)
-    cached_post = cache.get_post(source.team_id, source.channel_id, payload.source_message_id)
-    if cached_post is None:
-        raise HTTPException(status_code=404, detail="Cached post was not found")
-
-    record = build_manual_repost_record(
-        source.team_id,
-        source.channel_id,
-        destination.team_id,
-        destination.channel_id,
-        cached_post,
-        target_language,
-    )
-    history.upsert(record)
-    return {"status": "marked_reposted", "record": record}
+@app.post("/api/flows/{flow_name}/reposts/manual")
+async def mark_flow_repost_manually(flow_name: str, payload: ManualRepostRequest, request: Request) -> dict:
+    return await _mark_repost_manually_for_flow(_repost_flow(flow_name), payload, request)
 
 
 @app.post("/api/posts/{source_message_id}/translations")
 async def translate_post(source_message_id: str, request: Request, payload: TranslatePostRequest | None = None) -> dict:
+    return await _translate_post_for_flow(_repost_flow("forward"), source_message_id, request, payload)
+
+
+@app.post("/api/flows/{flow_name}/posts/{source_message_id}/translations")
+async def translate_flow_post(
+    flow_name: str,
+    source_message_id: str,
+    request: Request,
+    payload: TranslatePostRequest | None = None,
+) -> dict:
+    return await _translate_post_for_flow(_repost_flow(flow_name), source_message_id, request, payload)
+
+
+async def _translate_post_for_flow(
+    flow: RepostFlow,
+    source_message_id: str,
+    request: Request,
+    payload: TranslatePostRequest | None = None,
+) -> dict:
     payload = payload or TranslatePostRequest()
-    source = _configured_source()
+    source = flow.source
     get_access_token(request, settings)
     cache = PostCache(settings.post_cache_path)
     post = cache.get_post(source.team_id, source.channel_id, source_message_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Cached post was not found")
 
-    target_language = payload.target_language or settings.openai_translation_target
+    target_language = payload.target_language or flow.target_language
     existing = (post.get("translations") or {}).get(target_language)
     if existing and not payload.force:
         return {"cached": True, "target_language": target_language, "translation": existing}
@@ -294,7 +298,16 @@ async def translate_post(source_message_id: str, request: Request, payload: Tran
 
 @app.get("/api/posts/{source_message_id}/images.zip")
 async def download_all_embedded_images(source_message_id: str, request: Request) -> Response:
-    source = _configured_source()
+    return await _download_all_embedded_images_for_flow(_repost_flow("forward"), source_message_id, request)
+
+
+@app.get("/api/flows/{flow_name}/posts/{source_message_id}/images.zip")
+async def download_all_flow_embedded_images(flow_name: str, source_message_id: str, request: Request) -> Response:
+    return await _download_all_embedded_images_for_flow(_repost_flow(flow_name), source_message_id, request)
+
+
+async def _download_all_embedded_images_for_flow(flow: RepostFlow, source_message_id: str, request: Request) -> Response:
+    source = flow.source
     token = get_access_token(request, settings)
     async with _graph(token) as graph:
         message = await graph.get_message(source.team_id, source.channel_id, source_message_id)
@@ -324,7 +337,21 @@ async def download_all_embedded_images(source_message_id: str, request: Request)
 
 @app.get("/api/posts/{source_message_id}/images/{occurrence}")
 async def download_embedded_image(source_message_id: str, occurrence: int, request: Request) -> Response:
-    source = _configured_source()
+    return await _download_embedded_image_for_flow(_repost_flow("forward"), source_message_id, occurrence, request)
+
+
+@app.get("/api/flows/{flow_name}/posts/{source_message_id}/images/{occurrence}")
+async def download_flow_embedded_image(flow_name: str, source_message_id: str, occurrence: int, request: Request) -> Response:
+    return await _download_embedded_image_for_flow(_repost_flow(flow_name), source_message_id, occurrence, request)
+
+
+async def _download_embedded_image_for_flow(
+    flow: RepostFlow,
+    source_message_id: str,
+    occurrence: int,
+    request: Request,
+) -> Response:
+    source = flow.source
     token = get_access_token(request, settings)
     async with _graph(token) as graph:
         message = await graph.get_message(source.team_id, source.channel_id, source_message_id)
@@ -375,6 +402,171 @@ async def _translate_post(post: dict, target_language: str, settings) -> dict:
     return await translate_cached_post(post, target_language, settings)
 
 
+def _safe_auth_return_path(value: str | None) -> str:
+    return value if value in {"/", "/reverse"} else "/"
+
+
+def _repost_flow(flow_name: str) -> RepostFlow:
+    if flow_name == "forward":
+        return RepostFlow(
+            name="forward",
+            source=_configured_source(),
+            destination=_configured_destination(),
+            target_language=settings.openai_translation_target,
+            translation_target_label="Chinese",
+            exception_list_path=settings.exception_list_path,
+            skipped_body_prefixes=("原文作者：",),
+        )
+    if flow_name == "reverse":
+        return RepostFlow(
+            name="reverse",
+            source=_configured_destination(),
+            destination=_configured_source(),
+            target_language="en",
+            translation_target_label="English",
+            exception_list_path=_reverse_exception_list_path(),
+            skipped_body_prefixes=("原文作者：",),
+        )
+    raise HTTPException(status_code=404, detail=f"Unknown repost flow: {flow_name}")
+
+
+async def _list_posts_for_flow(
+    flow: RepostFlow,
+    request: Request,
+    limit: int,
+    cursor: str | None,
+    refresh: bool,
+    image_route_prefix: str,
+) -> dict:
+    source = flow.source
+    token = get_access_token(request, settings)
+    history = RepostHistory(settings.repost_history_path)
+    cache = PostCache(settings.post_cache_path)
+    exceptions = ExceptionList(flow.exception_list_path)
+    exception_emails = exceptions.email_set()
+    page_size = min(limit, settings.post_list_limit)
+    offset = 0 if refresh else (_decode_posts_cursor(cursor) if cursor else 0)
+    cache_meta = {
+        "last_refreshed_at": cache.source_status(source.team_id, source.channel_id)["last_refreshed_at"],
+        "new_posts_saved": 0,
+        "posts_skipped_by_exception": 0,
+        "posts_skipped_by_body_prefix": 0,
+        "posts_skipped_by_graph_error": 0,
+        "partial_refresh": False,
+        "refresh_failed": False,
+        "refresh_error": None,
+    }
+
+    if refresh:
+        try:
+            async with _graph(token) as graph:
+                cache_meta.update(await _refresh_post_cache(graph, flow, cache, exceptions, image_route_prefix))
+        except GraphAPIError as exc:
+            if not cache.has_posts(source.team_id, source.channel_id):
+                raise HTTPException(status_code=_graph_http_status(exc.status_code), detail=str(exc)) from exc
+            cache_meta.update(cache.source_status(source.team_id, source.channel_id))
+            cache_meta["refresh_failed"] = True
+            cache_meta["refresh_error"] = str(exc)
+
+    page = cache.page_posts(source.team_id, source.channel_id, offset, page_size, exception_emails, flow.skipped_body_prefixes)
+    return {
+        "flow": {
+            "name": flow.name,
+            "target_language": flow.target_language,
+            "translation_target_label": flow.translation_target_label,
+        },
+        "source": {"team_id": source.team_id, "channel_id": source.channel_id},
+        "destination": {"team_id": flow.destination.team_id, "channel_id": flow.destination.channel_id},
+        "posts": [_with_repost_status(post, source, history, flow.target_language) for post in page["posts"]],
+        "pagination": {
+            "limit": page_size,
+            "next_cursor": _encode_posts_cursor(page["next_offset"]) if page["next_offset"] is not None else None,
+            "has_next": page["next_offset"] is not None,
+        },
+        "cache": cache_meta,
+        "exceptions": {"emails": sorted(exception_emails)},
+    }
+
+
+async def _create_repost_for_flow(flow: RepostFlow, payload: CreateRepostRequest, request: Request) -> dict:
+    target_language = payload.target_language or flow.target_language
+    existing = _existing_repost_record(flow, payload.source_message_id, target_language)
+    if existing:
+        return {"status": "already_reposted", "record": existing}
+    token = get_access_token(request, settings)
+    return await _create_repost_with_token(flow, payload.source_message_id, target_language, token)
+
+
+async def _create_repost_with_token(flow: RepostFlow, source_message_id: str, target_language: str | None, token: str) -> dict:
+    source = flow.source
+    destination = flow.destination
+    history = RepostHistory(settings.repost_history_path)
+    target_language = target_language or flow.target_language
+    existing = history.get(source.team_id, source.channel_id, source_message_id, target_language)
+    if existing:
+        return {"status": "already_reposted", "record": existing}
+
+    cache = PostCache(settings.post_cache_path)
+    cached_post = cache.get_post(source.team_id, source.channel_id, source_message_id)
+    if cached_post is None:
+        raise HTTPException(status_code=404, detail="Cached post was not found")
+    translation = (cached_post.get("translations") or {}).get(target_language)
+    if translation is None:
+        raise HTTPException(status_code=409, detail=f"Translate this post to {target_language} before reposting")
+
+    parsed_source = TeamsMessageLink(
+        tenant_id=None,
+        team_id=source.team_id,
+        source_channel_thread_id=source.channel_id,
+        message_id=source_message_id,
+        parent_message_id=None,
+    )
+    async with _graph(token) as graph:
+        try:
+            report = await repost_translated_message(parsed_source, destination, graph, settings, translation, target_language)
+        except AttachmentRepostError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except GraphAPIError as exc:
+            raise HTTPException(status_code=_graph_http_status(exc.status_code), detail=str(exc)) from exc
+
+    record = build_repost_record(source.team_id, source.channel_id, destination.team_id, destination.channel_id, report, target_language)
+    history.upsert(record)
+    return {"status": "reposted", "record": record, "report": report}
+
+
+def _existing_repost_record(flow: RepostFlow, source_message_id: str, target_language: str | None) -> dict | None:
+    source = flow.source
+    return RepostHistory(settings.repost_history_path).get(source.team_id, source.channel_id, source_message_id, target_language or flow.target_language)
+
+
+async def _mark_repost_manually_for_flow(flow: RepostFlow, payload: ManualRepostRequest, request: Request) -> dict:
+    source = flow.source
+    destination = flow.destination
+    target_language = payload.target_language or flow.target_language
+    get_access_token(request, settings)
+
+    history = RepostHistory(settings.repost_history_path)
+    existing = history.get(source.team_id, source.channel_id, payload.source_message_id, target_language)
+    if existing:
+        return {"status": "already_reposted", "record": existing}
+
+    cache = PostCache(settings.post_cache_path)
+    cached_post = cache.get_post(source.team_id, source.channel_id, payload.source_message_id)
+    if cached_post is None:
+        raise HTTPException(status_code=404, detail="Cached post was not found")
+
+    record = build_manual_repost_record(
+        source.team_id,
+        source.channel_id,
+        destination.team_id,
+        destination.channel_id,
+        cached_post,
+        target_language,
+    )
+    history.upsert(record)
+    return {"status": "marked_reposted", "record": record}
+
+
 def _encode_posts_cursor(offset: int) -> str:
     payload = json.dumps({"offset": offset}, separators=(",", ":"))
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
@@ -393,10 +585,19 @@ def _decode_posts_cursor(cursor: str) -> int:
     return offset
 
 
-async def _refresh_post_cache(graph: GraphClient, source: DestinationChannel, cache: PostCache, exceptions: ExceptionList) -> dict:
+async def _refresh_post_cache(
+    graph: GraphClient,
+    flow: RepostFlow,
+    cache: PostCache,
+    exceptions: ExceptionList,
+    image_route_prefix: str,
+) -> dict:
+    source = flow.source
     newest_cached_id = cache.newest_message_id(source.team_id, source.channel_id)
     new_posts: list[dict] = []
     posts_skipped_by_exception = 0
+    posts_skipped_by_body_prefix = 0
+    posts_skipped_by_graph_error = 0
     next_url: str | None = None
     pages_checked = 0
     reached_cached_post = False
@@ -411,15 +612,22 @@ async def _refresh_post_cache(graph: GraphClient, source: DestinationChannel, ca
             if newest_cached_id and summary.get("id") == newest_cached_id:
                 reached_cached_post = True
                 break
+            if _should_skip_body_prefix(summary, flow.skipped_body_prefixes):
+                posts_skipped_by_body_prefix += 1
+                continue
             new_summaries.append(summary)
 
         if new_summaries:
-            hydrated = await _hydrate_messages(graph, source, new_summaries)
+            hydrated, hydration_failures = await _hydrate_messages(graph, source, new_summaries)
+            posts_skipped_by_graph_error += hydration_failures
             for message in hydrated:
+                if _should_skip_body_prefix(message, flow.skipped_body_prefixes):
+                    posts_skipped_by_body_prefix += 1
+                    continue
                 if exceptions.contains(extract_author_email(message)):
                     posts_skipped_by_exception += 1
                     continue
-                new_posts.append(_cached_post_summary(message))
+                new_posts.append(_cached_post_summary(message, image_route_prefix))
 
         if reached_cached_post or not newest_cached_id or not page["next_link"]:
             break
@@ -432,20 +640,24 @@ async def _refresh_post_cache(graph: GraphClient, source: DestinationChannel, ca
         "last_refreshed_at": result["last_refreshed_at"],
         "new_posts_saved": result["new_posts_saved"],
         "posts_skipped_by_exception": posts_skipped_by_exception,
+        "posts_skipped_by_body_prefix": posts_skipped_by_body_prefix,
+        "posts_skipped_by_graph_error": posts_skipped_by_graph_error,
         "partial_refresh": partial_refresh and not reached_cached_post,
         "refresh_failed": False,
         "refresh_error": None,
     }
 
 
-async def _hydrate_messages(graph: GraphClient, source: DestinationChannel, messages: list[dict]) -> list[dict]:
+async def _hydrate_messages(graph: GraphClient, source: DestinationChannel, messages: list[dict]) -> tuple[list[dict], int]:
     message_ids = [message["id"] for message in messages if message.get("id")]
-    hydrated = await graph.get_channel_messages(source.team_id, source.channel_id, message_ids)
-    if len(hydrated) == len(messages):
-        return hydrated
-
-    by_id = {message.get("id"): message for message in hydrated}
-    return [by_id.get(message.get("id"), message) for message in messages]
+    hydrated: list[dict] = []
+    failures = 0
+    for message_id in message_ids:
+        try:
+            hydrated.append(await graph.get_message(source.team_id, source.channel_id, message_id))
+        except GraphAPIError:
+            failures += 1
+    return hydrated, failures
 
 
 def _configured_source() -> DestinationChannel:
@@ -464,9 +676,16 @@ def _configured_destination() -> DestinationChannel:
     return DestinationChannel(settings.destination_team_id, settings.destination_channel_id)
 
 
-def _cached_post_summary(message: dict) -> dict:
+def _reverse_exception_list_path() -> Path:
+    if settings.reverse_exception_list_path is not None:
+        return settings.reverse_exception_list_path
+    return settings.exception_list_path.with_name(f"{settings.exception_list_path.stem}-reverse{settings.exception_list_path.suffix}")
+
+
+def _cached_post_summary(message: dict, image_route_prefix: str = "/api/posts") -> dict:
     message_id = message.get("id") or ""
     refs = _hosted_image_refs(message)
+    encoded_message_id = quote(message_id, safe="")
     return {
         "id": message_id,
         "subject": message.get("subject"),
@@ -474,18 +693,18 @@ def _cached_post_summary(message: dict) -> dict:
         "author_email": extract_author_email(message),
         "created_date_time": message.get("createdDateTime"),
         "web_url": message.get("webUrl"),
-        "body_html": _body_html(message, message_id),
+        "body_html": _body_html(message, message_id, image_route_prefix),
         "body_preview": _body_preview(message),
         "attachments": attachment_metadata(message.get("attachments") or []),
         "embedded_images": [
             {
                 "occurrence": ref.occurrence,
                 "hosted_content_id": ref.hosted_content_id,
-                "download_url": f"/api/posts/{quote(message_id, safe='')}/images/{ref.occurrence}",
+                "download_url": f"{image_route_prefix}/{encoded_message_id}/images/{ref.occurrence}",
             }
             for ref in refs
         ],
-        "embedded_images_zip_url": f"/api/posts/{quote(message_id, safe='')}/images.zip" if refs else None,
+        "embedded_images_zip_url": f"{image_route_prefix}/{encoded_message_id}/images.zip" if refs else None,
     }
 
 
@@ -518,9 +737,20 @@ def _hosted_image_ref(message: dict, occurrence: int):
 
 
 def _body_preview(message: dict) -> str:
+    return _visible_body_text(message)[:240]
+
+
+def _should_skip_body_prefix(message: dict, prefixes: tuple[str, ...]) -> bool:
+    if not prefixes:
+        return False
+    body_text = _visible_body_text(message)
+    return any(body_text.startswith(prefix) for prefix in prefixes)
+
+
+def _visible_body_text(message: dict) -> str:
     body_html = strip_attachment_placeholders(normalize_body_to_html(message))
     text = re.sub(r"<[^>]+>", " ", body_html)
-    return re.sub(r"\s+", " ", unescape(text)).strip()[:240]
+    return re.sub(r"[\s\u00a0]+", " ", unescape(text)).strip()
 
 
 def extract_author_email(message: dict) -> str | None:
@@ -544,11 +774,11 @@ def extract_author_email(message: dict) -> str | None:
     return None
 
 
-def _body_html(message: dict, message_id: str) -> str:
+def _body_html(message: dict, message_id: str, image_route_prefix: str = "/api/posts") -> str:
     encoded_message_id = quote(message_id, safe="")
 
     def image_src(ref) -> str:
-        return f"/api/posts/{encoded_message_id}/images/{ref.occurrence}"
+        return f"{image_route_prefix}/{encoded_message_id}/images/{ref.occurrence}"
 
     return sanitize_body_html_for_display(normalize_body_to_html(message), image_src)
 

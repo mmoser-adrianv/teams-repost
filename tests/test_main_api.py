@@ -34,10 +34,13 @@ class FakeGraph:
     def __init__(self) -> None:
         self.create_calls = 0
         self.created_payloads = []
+        self.created_destinations = []
         self.get_message_calls = []
         self.list_page_calls = []
         self.fail_list = False
         self.fail_create_with_attachments = False
+        self.fail_get_message_ids = set()
+        self.messages = {}
         self.pages = [
             {
                 "messages": [
@@ -72,6 +75,8 @@ class FakeGraph:
 
     async def get_message(self, team_id, channel_id, message_id, parent_message_id=None):
         self.get_message_calls.append(message_id)
+        if message_id in self.fail_get_message_ids:
+            raise GraphAPIError(500, "UnknownError")
         return self._message(message_id)
 
     async def get_message_hosted_contents(self, team_id, channel_id, message_id, parent_message_id=None):
@@ -82,6 +87,7 @@ class FakeGraph:
 
     async def create_channel_message(self, team_id, channel_id, payload):
         self.create_calls += 1
+        self.created_destinations.append({"team_id": team_id, "channel_id": channel_id})
         self.created_payloads.append(payload)
         if self.fail_create_with_attachments and payload.get("attachments"):
             raise GraphAPIError(400, "bad attachment cards")
@@ -94,7 +100,7 @@ class FakeGraph:
             "msg-2": "2026-06-02T01:02:03Z",
             "msg-1": "2026-06-01T01:02:03Z",
         }
-        return {
+        message = {
             "id": message_id,
             "subject": f"Source subject {message_id}",
             "createdDateTime": created_times.get(message_id, "2026-06-04T01:02:03Z"),
@@ -117,6 +123,8 @@ class FakeGraph:
                 }
             ],
         }
+        message.update(self.messages.get(message_id) or {})
+        return message
 
 
 class MainApiTests(unittest.TestCase):
@@ -126,10 +134,12 @@ class MainApiTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.original_get_access_token = main.get_access_token
         self.original_complete_login_flow = main.complete_login_flow
+        self.original_create_login_flow = main.create_login_flow
         self.original_graph = main._graph
         self.original_history_path = main.settings.repost_history_path
         self.original_post_cache_path = main.settings.post_cache_path
         self.original_exception_list_path = main.settings.exception_list_path
+        self.original_reverse_exception_list_path = main.settings.reverse_exception_list_path
         self.original_graph_base_url = main.settings.graph_base_url
         self.original_post_list_limit = main.settings.post_list_limit
         self.original_post_cache_max_refresh_pages = main.settings.post_cache_max_refresh_pages
@@ -141,6 +151,7 @@ class MainApiTests(unittest.TestCase):
         self.translation_calls = []
         main.get_access_token = lambda request, settings: "token"
         main.complete_login_flow = lambda request, settings: {"access_token": "token"}
+        main.create_login_flow = lambda request, settings: "https://login.example.com/authorize"
         main._graph = lambda token: FakeGraphContext(self.graph)
         main._translate_post = self._fake_translate_post
         main.settings.source_team_id = "source-team"
@@ -150,6 +161,7 @@ class MainApiTests(unittest.TestCase):
         main.settings.repost_history_path = Path(self.temp_dir.name) / "history.json"
         main.settings.post_cache_path = Path(self.temp_dir.name) / "post-cache.json"
         main.settings.exception_list_path = Path(self.temp_dir.name) / "exception-list.json"
+        main.settings.reverse_exception_list_path = Path(self.temp_dir.name) / "exception-list-reverse.json"
         main.settings.graph_base_url = "https://graph.microsoft.com/v1.0"
         main.settings.post_list_limit = 25
         main.settings.post_cache_max_refresh_pages = 3
@@ -161,10 +173,12 @@ class MainApiTests(unittest.TestCase):
     def _restore_main(self) -> None:
         main.get_access_token = self.original_get_access_token
         main.complete_login_flow = self.original_complete_login_flow
+        main.create_login_flow = self.original_create_login_flow
         main._graph = self.original_graph
         main.settings.repost_history_path = self.original_history_path
         main.settings.post_cache_path = self.original_post_cache_path
         main.settings.exception_list_path = self.original_exception_list_path
+        main.settings.reverse_exception_list_path = self.original_reverse_exception_list_path
         main.settings.graph_base_url = self.original_graph_base_url
         main.settings.post_list_limit = self.original_post_list_limit
         main.settings.post_cache_max_refresh_pages = self.original_post_cache_max_refresh_pages
@@ -203,11 +217,36 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 307)
         self.assertEqual(response.headers["location"], "/")
 
+    def test_auth_callback_preserves_reverse_page_return(self) -> None:
+        login_response = self.client.get("/auth/login?return_to=/reverse", follow_redirects=False)
+        callback_response = self.client.get("/auth/callback?code=ok&state=state", follow_redirects=False)
+
+        self.assertEqual(login_response.status_code, 307)
+        self.assertEqual(callback_response.status_code, 307)
+        self.assertEqual(callback_response.headers["location"], "/reverse")
+
+    def test_auth_callback_rejects_external_return_path(self) -> None:
+        self.client.get("/auth/login?return_to=https%3A%2F%2Fexample.com", follow_redirects=False)
+
+        response = self.client.get("/auth/callback?code=ok&state=state", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], "/")
+
     def test_auth_logout_clears_website_session(self) -> None:
         response = self.client.post("/auth/logout")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"signed_in": False})
+
+    def test_reverse_page_is_served_with_flow_config(self) -> None:
+        response = self.client.get("/reverse")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Chinese to English Repost Manager", response.text)
+        self.assertIn('apiBase: "/api/flows/reverse"', response.text)
+        self.assertIn('translationTargetLanguage: "en"', response.text)
+        self.assertIn('/auth/login">Sign in</a>', response.text)
 
     def test_exception_endpoints_require_sign_in(self) -> None:
         main.get_access_token = self.original_get_access_token
@@ -216,6 +255,9 @@ class MainApiTests(unittest.TestCase):
             ("get", "/api/exceptions", None),
             ("post", "/api/exceptions", {"email": "alex@example.com"}),
             ("delete", "/api/exceptions/alex%40example.com", None),
+            ("get", "/api/flows/reverse/exceptions", None),
+            ("post", "/api/flows/reverse/exceptions", {"email": "chen@example.com"}),
+            ("delete", "/api/flows/reverse/exceptions/chen%40example.com", None),
         ]
         for method, url, payload in requests:
             with self.subTest(method=method, url=url):
@@ -251,6 +293,148 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(post["author_email"], "alex@example.com")
         self.assertFalse(post["reposted"])
 
+    def test_flow_forward_posts_api_matches_legacy_source(self) -> None:
+        response = self.client.get("/api/flows/forward/posts?limit=5")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["flow"]["name"], "forward")
+        self.assertEqual(payload["flow"]["target_language"], "zh-Hans")
+        self.assertEqual(payload["source"], {"team_id": "source-team", "channel_id": "19:source@thread.tacv2"})
+        self.assertEqual(payload["destination"], {"team_id": "dest-team", "channel_id": "19:dest@thread.tacv2"})
+        self.assertEqual(self.graph.list_page_calls[0]["team_id"], "source-team")
+        self.assertIn('src="/api/flows/forward/posts/msg-1/images/1"', payload["posts"][0]["body_html"])
+
+    def test_forward_refresh_skips_reverse_repost_body_header(self) -> None:
+        self.graph.pages = [
+            {
+                "messages": [{"id": "reverse-repost-msg", "subject": "English repost"}],
+                "next_link": None,
+            }
+        ]
+        self.graph.messages["reverse-repost-msg"] = {
+            "body": {
+                "contentType": "html",
+                "content": "<p><strong>原文作者：</strong> Chen<br><strong>原文連結：</strong> Source</p><hr><p>English</p>",
+            }
+        }
+
+        response = self.client.get("/api/flows/forward/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["posts"], [])
+        self.assertEqual(payload["cache"]["new_posts_saved"], 0)
+        self.assertEqual(payload["cache"]["posts_skipped_by_body_prefix"], 1)
+        cache = PostCache(main.settings.post_cache_path)
+        self.assertEqual(cache.list_posts("source-team", "19:source@thread.tacv2"), [])
+
+    def test_reverse_posts_api_reads_destination_channel_as_source(self) -> None:
+        response = self.client.get("/api/flows/reverse/posts?limit=5")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["flow"]["name"], "reverse")
+        self.assertEqual(payload["flow"]["target_language"], "en")
+        self.assertEqual(payload["source"], {"team_id": "dest-team", "channel_id": "19:dest@thread.tacv2"})
+        self.assertEqual(payload["destination"], {"team_id": "source-team", "channel_id": "19:source@thread.tacv2"})
+        self.assertEqual(self.graph.list_page_calls[0]["team_id"], "dest-team")
+        self.assertEqual(self.graph.list_page_calls[0]["channel_id"], "19:dest@thread.tacv2")
+        self.assertIn('src="/api/flows/reverse/posts/msg-1/images/1"', payload["posts"][0]["body_html"])
+        self.assertEqual(payload["posts"][0]["embedded_images"][0]["download_url"], "/api/flows/reverse/posts/msg-1/images/1")
+
+    def test_reverse_refresh_skips_body_that_starts_with_original_author_header(self) -> None:
+        self.graph.pages = [
+            {
+                "messages": [{"id": "repost-msg", "subject": "普通主题"}],
+                "next_link": None,
+            }
+        ]
+        self.graph.messages["repost-msg"] = {
+            "body": {
+                "contentType": "html",
+                "content": "<p><strong>原文作者：</strong> Alex<br><strong>原文連結：</strong> Source</p><hr><p>中文</p>",
+            }
+        }
+
+        response = self.client.get("/api/flows/reverse/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["posts"], [])
+        self.assertEqual(payload["cache"]["new_posts_saved"], 0)
+        self.assertEqual(payload["cache"]["posts_skipped_by_body_prefix"], 1)
+        cache = PostCache(main.settings.post_cache_path)
+        self.assertEqual(cache.list_posts("dest-team", "19:dest@thread.tacv2"), [])
+
+    def test_reverse_refresh_skips_repost_header_before_hydration(self) -> None:
+        self.graph.pages = [
+            {
+                "messages": [
+                    {
+                        "id": "repost-msg",
+                        "subject": "普通主题",
+                        "body": {
+                            "contentType": "html",
+                            "content": "<p><strong>原文作者：</strong> Alex<br><strong>原文連結：</strong> Source</p>",
+                        },
+                    }
+                ],
+                "next_link": None,
+            }
+        ]
+        self.graph.fail_get_message_ids.add("repost-msg")
+
+        response = self.client.get("/api/flows/reverse/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["posts"], [])
+        self.assertEqual(payload["cache"]["posts_skipped_by_body_prefix"], 1)
+        self.assertEqual(payload["cache"]["posts_skipped_by_graph_error"], 0)
+        self.assertNotIn("repost-msg", self.graph.get_message_calls)
+
+    def test_reverse_refresh_skips_unhydratable_message_and_keeps_loading(self) -> None:
+        self.graph.pages = [
+            {
+                "messages": [
+                    {"id": "bad-msg", "body": {"contentType": "html", "content": "<p>Bad</p>"}},
+                    {"id": "msg-1", "body": {"contentType": "html", "content": "<p>Good</p>"}},
+                ],
+                "next_link": None,
+            }
+        ]
+        self.graph.fail_get_message_ids.add("bad-msg")
+
+        response = self.client.get("/api/flows/reverse/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual([post["id"] for post in payload["posts"]], ["msg-1"])
+        self.assertEqual(payload["cache"]["new_posts_saved"], 1)
+        self.assertEqual(payload["cache"]["posts_skipped_by_graph_error"], 1)
+        self.assertEqual(self.graph.get_message_calls, ["bad-msg", "msg-1"])
+
+    def test_reverse_refresh_does_not_skip_original_author_prefix_in_subject(self) -> None:
+        self.graph.pages = [
+            {
+                "messages": [{"id": "real-cn-msg", "subject": "原文作者：只在主题"}],
+                "next_link": None,
+            }
+        ]
+        self.graph.messages["real-cn-msg"] = {
+            "subject": "原文作者：只在主题",
+            "body": {"contentType": "html", "content": "<p>这是一条真正的中文消息。</p>"},
+        }
+
+        response = self.client.get("/api/flows/reverse/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual([post["id"] for post in payload["posts"]], ["real-cn-msg"])
+        self.assertEqual(payload["cache"]["new_posts_saved"], 1)
+        self.assertEqual(payload["cache"]["posts_skipped_by_body_prefix"], 0)
+
     def test_exception_list_can_be_managed_from_api(self) -> None:
         add_response = self.client.post("/api/exceptions", json={"email": " Alex@Example.com "})
         list_response = self.client.get("/api/exceptions")
@@ -260,6 +444,19 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(add_response.json()["emails"], ["alex@example.com"])
         self.assertEqual(list_response.json()["emails"], ["alex@example.com"])
         self.assertEqual(remove_response.json()["emails"], [])
+
+    def test_flow_exception_lists_are_managed_independently(self) -> None:
+        forward_add = self.client.post("/api/flows/forward/exceptions", json={"email": " Alex@Example.com "})
+        reverse_add = self.client.post("/api/flows/reverse/exceptions", json={"email": " Chen@Example.com "})
+        legacy_list = self.client.get("/api/exceptions")
+        reverse_list = self.client.get("/api/flows/reverse/exceptions")
+
+        self.assertEqual(forward_add.status_code, 200)
+        self.assertEqual(reverse_add.status_code, 200)
+        self.assertEqual(forward_add.json()["flow"]["name"], "forward")
+        self.assertEqual(reverse_add.json()["flow"]["name"], "reverse")
+        self.assertEqual(legacy_list.json()["emails"], ["alex@example.com"])
+        self.assertEqual(reverse_list.json()["emails"], ["chen@example.com"])
 
     def test_invalid_exception_email_returns_bad_request(self) -> None:
         response = self.client.post("/api/exceptions", json={"email": "not an email"})
@@ -279,6 +476,31 @@ class MainApiTests(unittest.TestCase):
         cache = PostCache(main.settings.post_cache_path)
         self.assertEqual(cache.list_posts("source-team", "19:source@thread.tacv2"), [])
 
+    def test_reverse_refresh_skips_posts_from_reverse_exception_email(self) -> None:
+        ExceptionList(main.settings.exception_list_path).add("alex@example.com")
+        ExceptionList(main.settings.reverse_exception_list_path).add("chen@example.com")
+        self.graph.messages["msg-1"] = {"from": {"user": {"displayName": "Chen", "email": "chen@example.com"}}}
+
+        response = self.client.get("/api/flows/reverse/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["posts"], [])
+        self.assertEqual(payload["cache"]["new_posts_saved"], 0)
+        self.assertEqual(payload["cache"]["posts_skipped_by_exception"], 1)
+        cache = PostCache(main.settings.post_cache_path)
+        self.assertEqual(cache.list_posts("dest-team", "19:dest@thread.tacv2"), [])
+
+    def test_forward_exception_list_does_not_filter_reverse_side(self) -> None:
+        ExceptionList(main.settings.exception_list_path).add("alex@example.com")
+
+        response = self.client.get("/api/flows/reverse/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual([post["id"] for post in payload["posts"]], ["msg-1"])
+        self.assertEqual(payload["cache"]["posts_skipped_by_exception"], 0)
+
     def test_cached_posts_from_exception_email_are_excluded_from_pages(self) -> None:
         PostCache(main.settings.post_cache_path).upsert_posts(
             "source-team",
@@ -291,6 +513,22 @@ class MainApiTests(unittest.TestCase):
         ExceptionList(main.settings.exception_list_path).add("alex@example.com")
 
         response = self.client.get("/api/posts?limit=10&refresh=false")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([post["id"] for post in response.json()["posts"]], ["msg-2"])
+
+    def test_cached_reverse_posts_from_reverse_exception_email_are_excluded_from_pages(self) -> None:
+        PostCache(main.settings.post_cache_path).upsert_posts(
+            "dest-team",
+            "19:dest@thread.tacv2",
+            [
+                {**self._cached_post("msg-1", "2026-06-01T01:02:03Z"), "author_email": "chen@example.com"},
+                {**self._cached_post("msg-2", "2026-06-02T01:02:03Z"), "author_email": "li@example.com"},
+            ],
+        )
+        ExceptionList(main.settings.reverse_exception_list_path).add("chen@example.com")
+
+        response = self.client.get("/api/flows/reverse/posts?limit=10&refresh=false")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([post["id"] for post in response.json()["posts"]], ["msg-2"])
@@ -363,6 +601,36 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(post["warnings"], ["Copied with warning"])
         self.assertEqual(self.graph.list_page_calls, [])
 
+    def test_cached_reverse_reposts_are_excluded_from_forward_page(self) -> None:
+        PostCache(main.settings.post_cache_path).upsert_posts(
+            "source-team",
+            "19:source@thread.tacv2",
+            [
+                {
+                    **self._cached_post("reverse-repost", "2026-06-05T09:09:25Z"),
+                    "subject": None,
+                    "author": None,
+                    "body_html": "<p><strong>原文作者：</strong> Chen<br><strong>原文連結：</strong> Source</p><hr><p>English repost</p>",
+                    "body_preview": "原文作者： Chen 原文連結： Source English repost",
+                },
+                self._cached_post("real-msg", "2026-06-04T01:02:03Z"),
+            ],
+        )
+        RepostHistory(main.settings.repost_history_path).upsert(
+            {
+                "source_key": "source-team|19:source@thread.tacv2|reverse-repost|translation:zh-Hans",
+                "source": {"team_id": "source-team", "channel_id": "19:source@thread.tacv2", "message_id": "reverse-repost"},
+                "destination": {"team_id": "dest-team", "channel_id": "19:dest@thread.tacv2", "message_id": "new-message"},
+                "translation": {"target_language": "zh-Hans"},
+            }
+        )
+
+        response = self.client.get("/api/posts?refresh=false")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([post["id"] for post in response.json()["posts"]], ["real-msg"])
+        self.assertEqual(self.graph.list_page_calls, [])
+
     def test_graph_failure_returns_cached_posts_with_warning(self) -> None:
         PostCache(main.settings.post_cache_path).upsert_posts(
             "source-team",
@@ -412,6 +680,21 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["target_language"], "zh-Hans")
         self.assertEqual(self.translation_calls[0]["target_language"], "zh-Hans")
+
+    def test_reverse_translate_defaults_to_english(self) -> None:
+        PostCache(main.settings.post_cache_path).upsert_posts(
+            "dest-team",
+            "19:dest@thread.tacv2",
+            [self._cached_post("msg-1", "2026-06-01T01:02:03Z")],
+        )
+
+        response = self.client.post("/api/flows/reverse/posts/msg-1/translations")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["target_language"], "en")
+        self.assertEqual(self.translation_calls[0]["target_language"], "en")
+        post = PostCache(main.settings.post_cache_path).get_post("dest-team", "19:dest@thread.tacv2", "msg-1")
+        self.assertEqual(post["translations"]["en"]["subject"], "Translated msg-1")
 
     def test_translate_cached_post_returns_saved_translation_without_provider_call(self) -> None:
         cache = PostCache(main.settings.post_cache_path)
@@ -516,6 +799,40 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.json()["record"]["source_key"], "source-team|19:source@thread.tacv2|msg-1|translation:zh-Hans")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "attached_reference")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["id"], attachment["id"])
+
+    def test_reverse_repost_uses_cached_english_translation_and_posts_to_original_source_channel(self) -> None:
+        cache = PostCache(main.settings.post_cache_path)
+        cache.upsert_posts("dest-team", "19:dest@thread.tacv2", [self._cached_post("msg-1", "2026-06-01T01:02:03Z")])
+        cache.upsert_translation(
+            "dest-team",
+            "19:dest@thread.tacv2",
+            "msg-1",
+            "en",
+            {
+                "subject": "English subject",
+                "body_html": '<p><strong>Hello</strong> <img src="/api/flows/reverse/posts/msg-1/images/1"></p>',
+                "body_preview": "Hello",
+            },
+        )
+        RepostHistory(main.settings.repost_history_path).upsert(
+            {
+                "source_key": "dest-team|19:dest@thread.tacv2|msg-1|translation:zh-Hans",
+                "source": {"team_id": "dest-team", "channel_id": "19:dest@thread.tacv2", "message_id": "msg-1"},
+                "destination": {"team_id": "source-team", "channel_id": "19:source@thread.tacv2", "message_id": "old-chinese"},
+                "translation": {"target_language": "zh-Hans"},
+            }
+        )
+
+        response = self.client.post("/api/flows/reverse/reposts", json={"source_message_id": "msg-1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.graph.created_destinations[0], {"team_id": "source-team", "channel_id": "19:source@thread.tacv2"})
+        payload = self.graph.created_payloads[0]
+        self.assertEqual(payload["subject"], "English subject")
+        self.assertIn("<strong>Hello</strong>", payload["body"]["content"])
+        self.assertIn('src="../hostedContents/1/$value"', payload["body"]["content"])
+        self.assertEqual(response.json()["record"]["source_key"], "dest-team|19:dest@thread.tacv2|msg-1|translation:en")
+        self.assertEqual(response.json()["record"]["translation"]["target_language"], "en")
 
     def test_successful_create_repost_is_saved_into_post_status(self) -> None:
         cache = PostCache(main.settings.post_cache_path)

@@ -3,6 +3,7 @@ const loginLink = document.querySelector("#loginLink");
 const manageExceptionsButton = document.querySelector("#manageExceptionsButton");
 const logoutButton = document.querySelector("#logoutButton");
 const refreshButton = document.querySelector("#refreshButton");
+const managerTitle = document.querySelector("#managerTitle");
 const loadingIndicator = document.querySelector("#loadingIndicator");
 const pageSize = document.querySelector("#pageSize");
 const prevPageButton = document.querySelector("#prevPageButton");
@@ -17,8 +18,19 @@ const exceptionForm = document.querySelector("#exceptionForm");
 const exceptionEmail = document.querySelector("#exceptionEmail");
 const exceptionsList = document.querySelector("#exceptionsList");
 const template = document.querySelector("#postTemplate");
-const translationTargetLanguage = "zh-Hans";
-const translationTargetLabel = "Chinese";
+const defaultConfig = {
+  apiBase: "/api/flows/forward",
+  exceptionsPath: "/api/exceptions",
+  pagePath: "/",
+  title: "Teams Repost Manager",
+  exceptionsTitle: "Exception List",
+  translationTargetLanguage: "zh-Hans",
+  translationTargetLabel: "Chinese",
+  emptyPostsMessage: "No posts returned from the configured source channel."
+};
+const managerConfig = {...defaultConfig, ...(window.TEAMS_REPOST_MANAGER_CONFIG || {})};
+const translationTargetLanguage = managerConfig.translationTargetLanguage;
+const translationTargetLabel = managerConfig.translationTargetLabel;
 const autoRefreshIntervalMs = 10 * 60 * 1000;
 
 let currentCursor = null;
@@ -46,9 +58,22 @@ exceptionsDialog.addEventListener("click", (event) => {
 exceptionsDialog.addEventListener("cancel", () => closeExceptionsDialog());
 
 async function boot() {
+  configurePage();
   await loadAuth();
   await loadPosts({reset: true, refresh: true});
   startAutoRefresh();
+}
+
+function configurePage() {
+  document.title = managerConfig.title;
+  if (managerTitle) {
+    managerTitle.textContent = managerConfig.title;
+  }
+  const exceptionsHeading = document.querySelector("#exceptionsHeading");
+  if (exceptionsHeading) {
+    exceptionsHeading.textContent = managerConfig.exceptionsTitle;
+  }
+  loginLink.href = `/auth/login?return_to=${encodeURIComponent(managerConfig.pagePath)}`;
 }
 
 async function loadAuth() {
@@ -108,7 +133,7 @@ async function loadExceptions() {
     return;
   }
   try {
-    const response = await fetch("/api/exceptions");
+    const response = await fetch(managerConfig.exceptionsPath);
     if (response.status === 401) {
       renderExceptions([]);
       return;
@@ -155,7 +180,7 @@ async function addException(event) {
   setMessage("");
   exceptionForm.querySelector("button").disabled = true;
   try {
-    const response = await fetch("/api/exceptions", {
+    const response = await fetch(managerConfig.exceptionsPath, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({email})
@@ -179,7 +204,7 @@ async function removeException(email, button) {
   button.disabled = true;
   setMessage("");
   try {
-    const response = await fetch(`/api/exceptions/${encodeURIComponent(email)}`, {method: "DELETE"});
+    const response = await fetch(`${managerConfig.exceptionsPath}/${encodeURIComponent(email)}`, {method: "DELETE"});
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
       throw new Error(error.detail || `Exception update failed with HTTP ${response.status}`);
@@ -262,7 +287,7 @@ async function loadPosts(options = {}) {
     if (!shouldRefresh && currentCursor) {
       params.set("cursor", currentCursor);
     }
-    const response = await fetch(`/api/posts?${params}`);
+    const response = await fetch(`${managerConfig.apiBase}/posts?${params}`);
     if (response.status === 401) {
       resetPagination();
       setMessage("Sign in to load posts.");
@@ -286,11 +311,10 @@ async function loadPosts(options = {}) {
     }
     if (!isQuiet && data.cache?.refresh_failed) {
       setMessage(`Showing saved posts. Refresh failed: ${data.cache.refresh_error || "Could not refresh from Microsoft Graph."}`);
-    } else if (!isQuiet && data.cache?.posts_skipped_by_exception) {
-      const count = data.cache.posts_skipped_by_exception;
-      setMessage(`Skipped ${count} post${count === 1 ? "" : "s"} from the exception list.`);
+    } else if (!isQuiet && skippedPostMessages(data.cache).length) {
+      setMessage(skippedPostMessages(data.cache).join(" "));
     } else if (!isQuiet && shouldRender && !data.posts.length) {
-      setMessage("No posts returned from the configured source channel.");
+      setMessage(managerConfig.emptyPostsMessage);
     }
   } catch (error) {
     if (!isQuiet) {
@@ -323,6 +347,23 @@ function startAutoRefresh() {
       render: isOnFirstPage
     });
   }, autoRefreshIntervalMs);
+}
+
+function skippedPostMessages(cache) {
+  const messages = [];
+  const exceptionCount = cache?.posts_skipped_by_exception || 0;
+  if (exceptionCount) {
+    messages.push(`Skipped ${exceptionCount} post${exceptionCount === 1 ? "" : "s"} from the exception list.`);
+  }
+  const bodyPrefixCount = cache?.posts_skipped_by_body_prefix || 0;
+  if (bodyPrefixCount) {
+    messages.push(`Skipped ${bodyPrefixCount} repost${bodyPrefixCount === 1 ? "" : "s"} from the loop-prevention filter.`);
+  }
+  const graphErrorCount = cache?.posts_skipped_by_graph_error || 0;
+  if (graphErrorCount) {
+    messages.push(`Skipped ${graphErrorCount} post${graphErrorCount === 1 ? "" : "s"} Microsoft Graph could not load.`);
+  }
+  return messages;
 }
 
 function sourceText(data) {
@@ -518,7 +559,7 @@ async function toggleTranslation(post, node, button) {
 }
 
 async function requestTranslation(post) {
-  const response = await fetch(`/api/posts/${encodeURIComponent(post.id)}/translations`, {
+  const response = await fetch(`${managerConfig.apiBase}/posts/${encodeURIComponent(post.id)}/translations`, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({target_language: translationTargetLanguage})
@@ -544,7 +585,7 @@ async function repost(post, node, button) {
   const originalLabel = button.textContent;
   try {
     button.textContent = "Reposting";
-    const response = await fetch("/api/reposts", {
+    const response = await fetch(`${managerConfig.apiBase}/reposts`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({source_message_id: post.id, target_language: translationTargetLanguage})
@@ -567,7 +608,7 @@ async function repost(post, node, button) {
 async function markManualReposted(post, node, input) {
   input.disabled = true;
   try {
-    const response = await fetch("/api/reposts/manual", {
+    const response = await fetch(`${managerConfig.apiBase}/reposts/manual`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({source_message_id: post.id, target_language: translationTargetLanguage})
