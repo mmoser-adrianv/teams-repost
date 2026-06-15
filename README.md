@@ -11,10 +11,10 @@ These payloads and endpoints were checked against Microsoft Graph documentation 
 - Send a channel message: `POST /teams/{team-id}/channels/{channel-id}/messages`
 - Get a channel message or reply: `GET /teams/{team-id}/channels/{channel-id}/messages/{message-id}` and `/replies/{reply-id}`
 - Hosted content: body image references use `../hostedContents/{temporaryId}/$value`, and `hostedContents` entries use `@microsoft.graph.temporaryId`, `contentBytes`, and `contentType`
-- File attachments: source `reference` attachments are downloaded from their SharePoint `contentUrl`, uploaded into the destination channel files folder, and attached to the repost as native `reference` attachments pointing at the copied destination file.
+- File attachments: source `reference` attachments are attached to the repost as native Teams `reference` attachment cards using their original `contentUrl`.
 - List source channel messages: `GET /teams/{team-id}/channels/{channel-id}/messages`
 
-Inline images are required when the source message contains them. If Graph cannot download an inline image or rejects the native hosted-content payload, the repost fails instead of publishing a degraded text-link fallback. File attachments are also required to copy and attach natively; copy failures block the repost.
+Inline images are required when the source message contains them. If Graph cannot download an inline image or rejects the native hosted-content payload, the repost fails instead of publishing a degraded text-link fallback. File attachments are also required to attach natively as Teams attachment cards; unsupported attachment types block the repost instead of becoming text links.
 
 ## Setup
 
@@ -40,14 +40,13 @@ Copy-Item .env.example .env
 - Delegated permissions to grant/admin-consent as needed:
   - `ChannelMessage.Read.All`
   - `ChannelMessage.Send`
-  - `Files.ReadWrite.All`
 
-The configured flow uses explicit team/channel IDs from environment variables, so it does not request team/channel discovery scopes. It does require file scopes so attachment cards can be copied into the destination channel and reposted as native Teams attachments.
+The configured flow uses explicit team/channel IDs from environment variables, so it does not request team/channel discovery scopes. Native `reference` attachment cards are reposted by reference and do not require file copy scopes.
 
 `GRAPH_SCOPES` controls the scopes requested during Microsoft sign-in. It accepts whitespace-separated or comma-separated values, for example:
 
 ```env
-GRAPH_SCOPES=offline_access ChannelMessage.Read.All ChannelMessage.Send Files.ReadWrite.All
+GRAPH_SCOPES=offline_access ChannelMessage.Read.All ChannelMessage.Send
 ```
 
 `offline_access` lets MSAL keep refreshing delegated Microsoft Graph tokens after the initial browser sign-in. The serialized MSAL cache is stored at `MSAL_TOKEN_CACHE_PATH`; treat this file like a backend secret. It must never be committed, logged, exposed under `/static`, or made readable by other server users.

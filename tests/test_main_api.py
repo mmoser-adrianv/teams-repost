@@ -931,10 +931,11 @@ class MainApiTests(unittest.TestCase):
         uuid.UUID(attachment["id"])
         self.assertIn(f'<attachment id="{attachment["id"]}"></attachment>', body)
         self.assertEqual(attachment["contentType"], "reference")
-        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/destination/source.docx")
+        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/source.docx")
         self.assertEqual(response.json()["record"]["source_key"], "source-team|19:source@thread.tacv2|msg-1|translation:zh-Hans")
-        self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "copied_reference_attached")
+        self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "attached_reference")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["id"], attachment["id"])
+        self.assertEqual(self.graph.file_api_calls, [])
 
     def test_create_repost_aborts_without_history_when_graph_rejects_hosted_content(self) -> None:
         cache = PostCache(main.settings.post_cache_path)

@@ -157,7 +157,7 @@ class InlineImageGraph:
 
 
 class ForwarderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_repost_copies_attachments_and_posts_native_cards(self) -> None:
+    async def test_repost_attaches_reference_attachments_without_file_copy(self) -> None:
         settings = Settings(
             AZURE_TENANT_ID="tenant",
             AZURE_CLIENT_ID="client",
@@ -180,13 +180,13 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         uuid.UUID(attachment["id"])
         self.assertIn(f'<attachment id="{attachment["id"]}"></attachment>', graph.created_payload["body"]["content"])
         self.assertEqual(attachment["contentType"], "reference")
-        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/destination/source.docx")
+        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/file.docx")
         self.assertEqual(attachment["name"], "source.docx")
-        self.assertEqual(report["attachment_statuses"][0]["status"], "copied_reference_attached")
+        self.assertEqual(report["attachment_statuses"][0]["status"], "attached_reference")
         self.assertEqual(report["attachment_statuses"][0]["id"], attachment["id"])
-        self.assertEqual(graph.file_api_calls, ["filesFolder", "driveItem", "download", "upload"])
+        self.assertEqual(graph.file_api_calls, [])
 
-    async def test_repost_copies_image_reference_attachments_as_native_cards(self) -> None:
+    async def test_repost_attaches_image_reference_attachments_as_native_cards(self) -> None:
         settings = Settings(
             AZURE_TENANT_ID="tenant",
             AZURE_CLIENT_ID="client",
@@ -215,8 +215,9 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f'<attachment id="{attachment["id"]}"></attachment>', body)
         self.assertNotIn("Open embedded image", body)
         self.assertNotIn("Open original message for embedded image", body)
-        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/destination/screenshot.png")
-        self.assertEqual(report["attachment_statuses"][0]["status"], "copied_reference_attached")
+        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/screenshot.png")
+        self.assertEqual(report["attachment_statuses"][0]["status"], "attached_reference")
+        self.assertEqual(graph.file_api_calls, [])
 
     async def test_repost_rejects_unsupported_attachments_before_posting(self) -> None:
         with self.assertRaises(AttachmentRepostError):

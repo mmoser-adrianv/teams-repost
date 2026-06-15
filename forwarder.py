@@ -5,7 +5,6 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
-from file_copier import CopiedFile, FileCopier
 from graph_client import GraphAPIError, GraphClient
 from message_rebuilder import (
     HostedContentRef,
@@ -106,7 +105,7 @@ async def repost_parsed_message(
         )
 
     subject = build_forward_subject(source_message)
-    prepared_attachments = await _prepare_attachments_for_repost(attachments, destination, graph, settings)
+    prepared_attachments = _prepare_attachments_for_repost(attachments)
     downloaded_images = await _download_required_hosted_images(parsed_source, hosted_refs, graph, settings)
     inline_body = replace_hosted_content_refs(original_body_html, downloaded_images)
     body = _body_with_reference_attachments(
@@ -164,7 +163,7 @@ async def repost_translated_message(
     translated_body_html = translation.get("body_html") or ""
     display_refs = find_display_image_refs(translated_body_html)
 
-    prepared_attachments = await _prepare_attachments_for_repost(attachments, destination, graph, settings)
+    prepared_attachments = _prepare_attachments_for_repost(attachments)
     downloaded_images = await _download_required_hosted_images(parsed_source, hosted_refs, graph, settings)
     inline_body = replace_display_image_refs(translated_body_html, downloaded_images)
     _ensure_translated_body_references_images(inline_body, downloaded_images, display_refs)
@@ -277,51 +276,11 @@ async def _download_required_hosted_images(
     return uploads
 
 
-async def _prepare_attachments_for_repost(
-    attachments: list[dict],
-    destination: DestinationChannel,
-    graph: GraphClient,
-    settings: Settings,
-) -> PreparedAttachments:
+def _prepare_attachments_for_repost(attachments: list[dict]) -> PreparedAttachments:
     if not attachments:
         return PreparedAttachments([], [])
-    _validate_reference_attachments(attachments)
-    files_folder = await graph.get_channel_files_folder(destination.team_id, destination.channel_id)
-    copier = FileCopier(
-        graph,
-        files_folder,
-        settings.temp_folder,
-        settings.max_file_size_bytes,
-    )
-    copied_files, warnings = await copier.copy_attachments(attachments)
-    if warnings:
-        raise AttachmentRepostError("Cannot repost native attachment cards: " + "; ".join(warnings))
-    if len(copied_files) != len(attachments):
-        raise AttachmentRepostError("Cannot repost native attachment cards because not every source attachment was copied.")
-    return _reference_attachments_from_copied_files(copied_files)
-
-
-def _reference_attachments_from_copied_files(copied_files: list[CopiedFile]) -> PreparedAttachments:
-    reference_attachments: list[ReferenceAttachment] = []
-    statuses: list[dict[str, Any]] = []
-    for copied in copied_files:
-        if not copied.web_url:
-            raise AttachmentRepostError(f"Copied attachment '{copied.name}' did not return a SharePoint webUrl for the native Teams card.")
-        attachment = ReferenceAttachment(
-            id=str(uuid.uuid4()),
-            name=copied.name,
-            content_url=copied.web_url,
-        )
-        reference_attachments.append(attachment)
-        statuses.append(
-            {
-                **attachment.to_status(),
-                "status": "copied_reference_attached",
-                "source_content_url": copied.source_content_url,
-                "drive_item_id": copied.drive_item_id,
-            }
-        )
-    return PreparedAttachments(reference_attachments, statuses)
+    reference_attachments = build_reference_attachments(attachments)
+    return PreparedAttachments(reference_attachments, [attachment.to_status() for attachment in reference_attachments])
 
 
 def build_reference_attachments(attachments: list[dict]) -> list[ReferenceAttachment]:
@@ -365,7 +324,7 @@ def _pending_attachment_statuses(attachments: list[dict]) -> list[dict[str, Any]
         {
             "name": attachment.get("name") or f"attachment-{index}",
             "content_url": attachment.get("contentUrl"),
-            "status": "requires_copy",
+            "status": "will_attach_reference",
         }
         for index, attachment in enumerate(attachments, start=1)
     ]
