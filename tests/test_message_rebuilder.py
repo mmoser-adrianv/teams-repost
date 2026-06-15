@@ -2,7 +2,6 @@ import unittest
 
 from message_rebuilder import (
     HostedContentUpload,
-    LinkReplacement,
     ReferenceAttachment,
     append_attachment_placeholders,
     build_channel_message_payload,
@@ -10,7 +9,6 @@ from message_rebuilder import (
     find_hosted_content_refs,
     replace_hosted_content_refs,
     replace_display_image_refs,
-    replace_hosted_content_with_links,
     replace_hosted_content_with_temporary_refs,
     sanitize_body_html_for_display,
     strip_attachment_placeholders,
@@ -74,15 +72,7 @@ class MessageRebuilderTests(unittest.TestCase):
         self.assertIn('src="../hostedContents/1/$value"', rewritten)
         self.assertNotIn("<at", rewritten)
 
-    def test_replaces_hosted_content_refs_with_links(self) -> None:
-        rewritten = replace_hosted_content_with_links(
-            '<p>before<img src="../hostedContents/image-id/$value">after</p>',
-            [LinkReplacement(occurrence=1, href="https://contoso/files/image.png", label="image.png")],
-        )
-
-        self.assertEqual(rewritten, '<p>before<a href="https://contoso/files/image.png">image.png</a>after</p>')
-
-    def test_replaces_hosted_content_refs_with_mixed_uploads_and_links(self) -> None:
+    def test_replaces_hosted_content_refs_with_uploads(self) -> None:
         rewritten = replace_hosted_content_refs(
             '<p><img src="../hostedContents/image-1/$value"><img src="../hostedContents/image-2/$value"></p>',
             [
@@ -94,13 +84,12 @@ class MessageRebuilderTests(unittest.TestCase):
                     content_bytes=b"png",
                 )
             ],
-            [LinkReplacement(occurrence=2, href="https://teams/source", label="Embedded image 2")],
         )
 
         self.assertIn('src="../hostedContents/1/$value"', rewritten)
-        self.assertIn('<a href="https://teams/source">Embedded image 2</a>', rewritten)
+        self.assertIn('src="../hostedContents/image-2/$value"', rewritten)
 
-    def test_replaces_cached_display_image_refs_with_mixed_uploads_and_links(self) -> None:
+    def test_replaces_cached_display_image_refs_with_uploads(self) -> None:
         rewritten = replace_display_image_refs(
             '<p><img src="/api/posts/msg-1/images/1"><img src="/api/posts/msg-1/images/2"></p>',
             [
@@ -112,11 +101,10 @@ class MessageRebuilderTests(unittest.TestCase):
                     content_bytes=b"png",
                 )
             ],
-            [LinkReplacement(occurrence=2, href="https://teams/source", label="Embedded image 2")],
         )
 
         self.assertIn('src="../hostedContents/1/$value"', rewritten)
-        self.assertIn('<a href="https://teams/source">Embedded image 2</a>', rewritten)
+        self.assertIn('src="/api/posts/msg-1/images/2"', rewritten)
 
     def test_replaces_flow_display_image_refs(self) -> None:
         rewritten = replace_display_image_refs(
@@ -130,7 +118,6 @@ class MessageRebuilderTests(unittest.TestCase):
                     content_bytes=b"png",
                 )
             ],
-            [],
         )
 
         self.assertIn('src="../hostedContents/1/$value"', rewritten)

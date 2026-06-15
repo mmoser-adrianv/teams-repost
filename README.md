@@ -1,6 +1,6 @@
 # Teams Repost Graph POC
 
-FastAPI proof-of-concept for reconstructing a Microsoft Teams channel message into another Teams channel using Microsoft Graph. It creates a new post with an audit-friendly header, preserves the original HTML body where possible, attempts Teams hosted-content inline images, and keeps original attachment links in a local manager UI for manual handling.
+FastAPI proof-of-concept for reconstructing a Microsoft Teams channel message into another Teams channel using Microsoft Graph. It creates a new post with an audit-friendly header, preserves the original HTML body where possible, recreates Teams hosted-content inline images, and reposts file attachments as native Teams attachment cards.
 
 This does not recreate the native Teams "Share to channel" forwarded-message UI.
 
@@ -11,9 +11,10 @@ These payloads and endpoints were checked against Microsoft Graph documentation 
 - Send a channel message: `POST /teams/{team-id}/channels/{channel-id}/messages`
 - Get a channel message or reply: `GET /teams/{team-id}/channels/{channel-id}/messages/{message-id}` and `/replies/{reply-id}`
 - Hosted content: body image references use `../hostedContents/{temporaryId}/$value`, and `hostedContents` entries use `@microsoft.graph.temporaryId`, `contentBytes`, and `contentType`
+- File attachments: source `reference` attachments are downloaded from their SharePoint `contentUrl`, uploaded into the destination channel files folder, and attached to the repost as native `reference` attachments pointing at the copied destination file.
 - List source channel messages: `GET /teams/{team-id}/channels/{channel-id}/messages`
 
-Inline images are attempted when `TRY_INLINE_HOSTED_CONTENTS=true`. If Graph rejects the hosted-content payload in post mode, the app reposts without embedded images and keeps image download links in the manager UI. File attachments are not copied because the default permission model avoids SharePoint file scopes.
+Inline images are required when the source message contains them. If Graph cannot download an inline image or rejects the native hosted-content payload, the repost fails instead of publishing a degraded text-link fallback. File attachments are also required to copy and attach natively; copy failures block the repost.
 
 ## Setup
 
@@ -39,20 +40,19 @@ Copy-Item .env.example .env
 - Delegated permissions to grant/admin-consent as needed:
   - `ChannelMessage.Read.All`
   - `ChannelMessage.Send`
+  - `Files.ReadWrite.All`
 
-The configured flow uses explicit team/channel IDs from environment variables, so it does not request team/channel discovery scopes or SharePoint file scopes.
+The configured flow uses explicit team/channel IDs from environment variables, so it does not request team/channel discovery scopes. It does require file scopes so attachment cards can be copied into the destination channel and reposted as native Teams attachments.
 
 `GRAPH_SCOPES` controls the scopes requested during Microsoft sign-in. It accepts whitespace-separated or comma-separated values, for example:
 
 ```env
-GRAPH_SCOPES=offline_access ChannelMessage.Read.All ChannelMessage.Send
+GRAPH_SCOPES=offline_access ChannelMessage.Read.All ChannelMessage.Send Files.ReadWrite.All
 ```
 
 `offline_access` lets MSAL keep refreshing delegated Microsoft Graph tokens after the initial browser sign-in. The serialized MSAL cache is stored at `MSAL_TOKEN_CACHE_PATH`; treat this file like a backend secret. It must never be committed, logged, exposed under `/static`, or made readable by other server users.
 
 `POST_CACHE_PATH` stores pulled source-channel posts separately from repost history. `POST_CACHE_MAX_REFRESH_PAGES` limits how many Microsoft Graph pages a refresh checks while looking for posts newer than the latest cached post.
-
-`APP_BASE_URL` is optional. When set to the externally reachable manager URL, fallback embedded-image links in reposts can point to the manager image download route. When omitted, fallback links point to the original Teams message.
 
 `EXCEPTION_LIST_PATH` stores English-side email addresses that should be skipped. `REVERSE_EXCEPTION_LIST_PATH` stores the separate Chinese-side list; when it is omitted, the app uses a sibling file named like `exception-list-reverse.json`. Each manager UI can add or remove addresses for its own side, and the matching posts API excludes cached or newly pulled posts whose available sender email matches that side's list.
 

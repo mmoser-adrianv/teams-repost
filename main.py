@@ -22,8 +22,8 @@ from auth import auth_status, complete_login_flow, create_login_flow, get_access
 from exception_list import ExceptionList, normalize_email
 from file_copier import image_extension
 from forwarder import (
-    AttachmentRepostError,
     DestinationChannel,
+    RepostFidelityError,
     attachment_metadata,
     forward_message,
     repost_parsed_message,
@@ -379,6 +379,8 @@ async def forward_message_route(payload: ForwardMessageRequest, request: Request
             return await forward_message(payload, graph, settings)
         except TeamsUrlParseError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RepostFidelityError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except GraphAPIError as exc:
@@ -530,7 +532,7 @@ async def _create_repost_with_token(flow: RepostFlow, source_message_id: str, ta
     async with _graph(token) as graph:
         try:
             report = await repost_translated_message(parsed_source, destination, graph, settings, translation, target_language)
-        except AttachmentRepostError as exc:
+        except RepostFidelityError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except GraphAPIError as exc:
             raise HTTPException(status_code=_graph_http_status(exc.status_code), detail=str(exc)) from exc

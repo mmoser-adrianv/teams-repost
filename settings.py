@@ -44,8 +44,6 @@ class Settings(BaseSettings):
     max_file_size_mb: int = Field(default=25, alias="MAX_FILE_SIZE_MB", ge=1)
     temp_folder: Path = Field(default_factory=lambda: Path(tempfile.gettempdir()) / "teams-repost", alias="TEMP_FOLDER")
     session_secret: str = Field(default="dev-only-change-me", alias="SESSION_SECRET")
-    link_original_on_copy_failure: bool = Field(default=False, alias="LINK_ORIGINAL_ON_COPY_FAILURE")
-    app_base_url: str | None = Field(default=None, alias="APP_BASE_URL")
     graph_request_timeout_seconds: float = Field(default=60.0, alias="GRAPH_REQUEST_TIMEOUT_SECONDS")
     graph_max_retries: int = Field(default=3, alias="GRAPH_MAX_RETRIES", ge=0)
     try_inline_hosted_contents: bool = Field(default=True, alias="TRY_INLINE_HOSTED_CONTENTS")
@@ -69,14 +67,6 @@ class Settings(BaseSettings):
         if not parse_graph_scopes(value):
             raise ValueError("GRAPH_SCOPES must include at least one scope")
         return value
-
-    @field_validator("app_base_url")
-    @classmethod
-    def normalize_app_base_url(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip().rstrip("/")
-        return normalized or None
 
     @field_validator("automation_flows")
     @classmethod

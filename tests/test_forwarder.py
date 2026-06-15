@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from forwarder import (
     AttachmentRepostError,
     DestinationChannel,
+    InlineImageRepostError,
     build_reference_attachments,
     forward_message,
     repost_parsed_message,
@@ -27,6 +28,7 @@ class Request:
 class FakeGraph:
     def __init__(self, attachment: dict | None = None) -> None:
         self.created_payload = None
+        self.file_api_calls = []
         self.attachment = attachment or {
             "id": "file-1",
             "name": "source.docx",
@@ -54,16 +56,24 @@ class FakeGraph:
         return {"id": "new-message", "webUrl": "https://teams.microsoft.com/repost"}
 
     async def get_channel_files_folder(self, *args, **kwargs):
-        raise AssertionError("filesFolder must not be called in channel-only repost flow")
+        self.file_api_calls.append("filesFolder")
+        return {"id": "folder-id", "parentReference": {"driveId": "drive-id"}}
 
-    async def upload_file_to_channel_folder(self, *args, **kwargs):
-        raise AssertionError("file upload must not be called in channel-only repost flow")
+    async def upload_file_to_channel_folder(self, files_folder, file_name, content, content_type="application/octet-stream", conflict_behavior="fail"):
+        self.file_api_calls.append("upload")
+        return {
+            "id": "copied-file-1",
+            "name": file_name,
+            "webUrl": f"https://contoso.sharepoint.com/destination/{file_name}",
+        }
 
-    async def get_drive_item_from_share_url(self, *args, **kwargs):
-        raise AssertionError("share driveItem lookup must not be called in channel-only repost flow")
+    async def get_drive_item_from_share_url(self, content_url):
+        self.file_api_calls.append("driveItem")
+        return {"id": "source-drive-item", "name": self.attachment.get("name"), "size": 12, "file": {}}
 
-    async def download_drive_item_from_share_url(self, *args, **kwargs):
-        raise AssertionError("share download must not be called in channel-only repost flow")
+    async def download_drive_item_from_share_url(self, content_url):
+        self.file_api_calls.append("download")
+        return b"file-content", "application/octet-stream"
 
 
 class InlineImageGraph:
@@ -77,6 +87,7 @@ class InlineImageGraph:
         self.fail_second_download = fail_second_download
         self.include_attachment = include_attachment
         self.created_payloads = []
+        self.file_api_calls = []
 
     async def get_message(self, team_id, channel_id, message_id, parent_message_id=None):
         message = {
@@ -124,9 +135,29 @@ class InlineImageGraph:
             )
         return {"id": f"new-message-{len(self.created_payloads)}", "webUrl": "https://teams.microsoft.com/repost"}
 
+    async def get_channel_files_folder(self, *args, **kwargs):
+        self.file_api_calls.append("filesFolder")
+        return {"id": "folder-id", "parentReference": {"driveId": "drive-id"}}
+
+    async def get_drive_item_from_share_url(self, content_url):
+        self.file_api_calls.append("driveItem")
+        return {"id": "source-drive-item", "name": "source.docx", "size": 12, "file": {}}
+
+    async def download_drive_item_from_share_url(self, content_url):
+        self.file_api_calls.append("download")
+        return b"file-content", "application/octet-stream"
+
+    async def upload_file_to_channel_folder(self, files_folder, file_name, content, content_type="application/octet-stream", conflict_behavior="fail"):
+        self.file_api_calls.append("upload")
+        return {
+            "id": "copied-file-1",
+            "name": file_name,
+            "webUrl": f"https://contoso.sharepoint.com/destination/{file_name}",
+        }
+
 
 class ForwarderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_repost_with_attachments_does_not_call_file_apis(self) -> None:
+    async def test_repost_copies_attachments_and_posts_native_cards(self) -> None:
         settings = Settings(
             AZURE_TENANT_ID="tenant",
             AZURE_CLIENT_ID="client",
@@ -149,13 +180,13 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         uuid.UUID(attachment["id"])
         self.assertIn(f'<attachment id="{attachment["id"]}"></attachment>', graph.created_payload["body"]["content"])
         self.assertEqual(attachment["contentType"], "reference")
-        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/file.docx")
+        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/destination/source.docx")
         self.assertEqual(attachment["name"], "source.docx")
-        self.assertEqual(report["attachment_statuses"][0]["status"], "attached_reference")
+        self.assertEqual(report["attachment_statuses"][0]["status"], "copied_reference_attached")
         self.assertEqual(report["attachment_statuses"][0]["id"], attachment["id"])
-        self.assertNotIn("File attachments are not copied", " ".join(report["warnings"]))
+        self.assertEqual(graph.file_api_calls, ["filesFolder", "driveItem", "download", "upload"])
 
-    async def test_repost_links_image_reference_attachments_in_body_without_native_cards(self) -> None:
+    async def test_repost_copies_image_reference_attachments_as_native_cards(self) -> None:
         settings = Settings(
             AZURE_TENANT_ID="tenant",
             AZURE_CLIENT_ID="client",
@@ -180,10 +211,12 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         report = await forward_message(request, graph, settings)
 
         body = graph.created_payload["body"]["content"]
-        self.assertNotIn("attachments", graph.created_payload)
-        self.assertNotIn("<attachment", body)
-        self.assertIn('<a href="https://contoso.sharepoint.com/screenshot.png">screenshot.png</a>', body)
-        self.assertEqual(report["attachment_statuses"][0]["status"], "linked_reference_image")
+        attachment = graph.created_payload["attachments"][0]
+        self.assertIn(f'<attachment id="{attachment["id"]}"></attachment>', body)
+        self.assertNotIn("Open embedded image", body)
+        self.assertNotIn("Open original message for embedded image", body)
+        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/destination/screenshot.png")
+        self.assertEqual(report["attachment_statuses"][0]["status"], "copied_reference_attached")
 
     async def test_repost_rejects_unsupported_attachments_before_posting(self) -> None:
         with self.assertRaises(AttachmentRepostError):
@@ -239,7 +272,7 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["hostedContents"][0]["contentBytes"], b64encode(b"bytes-image-1").decode("ascii"))
         self.assertEqual([item["status"] for item in report["inline_image_statuses"]], ["recreated_inline", "recreated_inline"])
 
-    async def test_repost_links_failed_downloads_and_still_embeds_downloaded_images(self) -> None:
+    async def test_repost_aborts_when_any_inline_image_download_fails(self) -> None:
         settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
         graph = InlineImageGraph(fail_second_download=True)
         parsed = TeamsMessageLink(
@@ -251,16 +284,12 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
             raw_url="https://teams.microsoft.com/source",
         )
 
-        report = await repost_parsed_message(parsed, DestinationChannel("dest-team", "dest-channel"), graph, settings)
+        with self.assertRaises(InlineImageRepostError):
+            await repost_parsed_message(parsed, DestinationChannel("dest-team", "dest-channel"), graph, settings)
 
-        payload = graph.created_payloads[0]
-        body = payload["body"]["content"]
-        self.assertEqual(len(payload["hostedContents"]), 1)
-        self.assertIn('src="../hostedContents/1/$value"', body)
-        self.assertIn('<a href="https://teams.microsoft.com/source">Open original message for embedded image 2</a>', body)
-        self.assertEqual([item["status"] for item in report["inline_image_statuses"]], ["recreated_inline", "download_failed_linked"])
+        self.assertEqual(graph.created_payloads, [])
 
-    async def test_repost_falls_back_to_links_when_graph_rejects_hosted_content(self) -> None:
+    async def test_repost_aborts_without_fallback_when_graph_rejects_hosted_content(self) -> None:
         settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
         graph = InlineImageGraph(fail_inline_post=True, include_attachment=True)
         parsed = TeamsMessageLink(
@@ -272,26 +301,18 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
             raw_url="https://teams.microsoft.com/source",
         )
 
-        report = await repost_parsed_message(parsed, DestinationChannel("dest-team", "dest-channel"), graph, settings)
+        with self.assertRaises(GraphAPIError):
+            await repost_parsed_message(parsed, DestinationChannel("dest-team", "dest-channel"), graph, settings)
 
-        self.assertEqual(len(graph.created_payloads), 2)
-        fallback_payload = graph.created_payloads[1]
-        self.assertNotIn("hostedContents", fallback_payload)
-        self.assertIn("attachments", fallback_payload)
-        attachment_id = fallback_payload["attachments"][0]["id"]
+        self.assertEqual(len(graph.created_payloads), 1)
+        attempted_payload = graph.created_payloads[0]
+        self.assertIn("hostedContents", attempted_payload)
+        self.assertIn("attachments", attempted_payload)
+        attachment_id = attempted_payload["attachments"][0]["id"]
         uuid.UUID(attachment_id)
-        self.assertIn(f'<attachment id="{attachment_id}"></attachment>', fallback_payload["body"]["content"])
-        self.assertIn("Open original message for embedded image 1", fallback_payload["body"]["content"])
-        self.assertIn("Inline image recreation failed", " ".join(report["warnings"]))
-        self.assertEqual([item["status"] for item in report["inline_image_statuses"]], ["omitted_from_repost", "omitted_from_repost"])
-        self.assertEqual(report["attachment_statuses"][0]["status"], "attached_reference")
-        diagnostics = report["inline_image_diagnostics"][0]
-        self.assertEqual(diagnostics["status"], "graph_rejected_hosted_contents")
-        self.assertEqual(diagnostics["image_count"], 2)
-        self.assertEqual(diagnostics["content_types"], ["image/png"])
-        self.assertEqual(diagnostics["byte_sizes"], [13, 13])
-        self.assertEqual(diagnostics["response_body"]["accessToken"], "[redacted]")
-        self.assertEqual(diagnostics["response_body"]["contentBytes"], "[redacted]")
+        self.assertIn(f'<attachment id="{attachment_id}"></attachment>', attempted_payload["body"]["content"])
+        self.assertNotIn("Open embedded image", attempted_payload["body"]["content"])
+        self.assertNotIn("Open original message for embedded image", attempted_payload["body"]["content"])
 
     async def test_translated_repost_uses_translated_body_and_recreates_images(self) -> None:
         settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
@@ -334,12 +355,8 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload["hostedContents"]), 2)
         self.assertEqual(payload["attachments"][0]["contentType"], "reference")
 
-    async def test_translated_repost_fallback_uses_absolute_manager_image_links_when_configured(self) -> None:
-        settings = Settings(
-            AZURE_TENANT_ID="tenant",
-            AZURE_CLIENT_ID="client",
-            APP_BASE_URL="https://repost.example.com/",
-        )
+    async def test_translated_repost_aborts_without_fallback_when_graph_rejects_hosted_content(self) -> None:
+        settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
         graph = InlineImageGraph(fail_inline_post=True)
         parsed = TeamsMessageLink(
             tenant_id=None,
@@ -350,31 +367,26 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
             raw_url="https://teams.microsoft.com/source",
         )
 
-        report = await repost_translated_message(
-            parsed,
-            DestinationChannel("dest-team", "dest-channel"),
-            graph,
-            settings,
-            {
-                "subject": "Chinese subject",
-                "body_html": (
-                    '<p><img src="/api/flows/forward/posts/msg-1/images/1">'
-                    '<img src="/api/flows/forward/posts/msg-1/images/2"></p>'
-                ),
-            },
-            "zh-Hans",
-        )
+        with self.assertRaises(GraphAPIError):
+            await repost_translated_message(
+                parsed,
+                DestinationChannel("dest-team", "dest-channel"),
+                graph,
+                settings,
+                {
+                    "subject": "Chinese subject",
+                    "body_html": (
+                        '<p><img src="/api/flows/forward/posts/msg-1/images/1">'
+                        '<img src="/api/flows/forward/posts/msg-1/images/2"></p>'
+                    ),
+                },
+                "zh-Hans",
+            )
 
-        fallback_body = graph.created_payloads[1]["body"]["content"]
-        self.assertIn(
-            '<a href="https://repost.example.com/api/flows/forward/posts/msg-1/images/1">Open embedded image 1 in repost manager</a>',
-            fallback_body,
-        )
-        self.assertIn(
-            '<a href="https://repost.example.com/api/flows/forward/posts/msg-1/images/2">Open embedded image 2 in repost manager</a>',
-            fallback_body,
-        )
-        self.assertEqual([item["status"] for item in report["inline_image_statuses"]], ["omitted_from_repost", "omitted_from_repost"])
+        self.assertEqual(len(graph.created_payloads), 1)
+        self.assertIn("hostedContents", graph.created_payloads[0])
+        self.assertNotIn("Open embedded image", graph.created_payloads[0]["body"]["content"])
+        self.assertNotIn("Open original message for embedded image", graph.created_payloads[0]["body"]["content"])
 
 
 if __name__ == "__main__":

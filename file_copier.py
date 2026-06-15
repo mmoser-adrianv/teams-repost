@@ -46,13 +46,11 @@ class FileCopier:
         files_folder: dict,
         temp_folder: Path,
         max_file_size_bytes: int,
-        link_original_on_copy_failure: bool = False,
     ) -> None:
         self.graph = graph
         self.files_folder = files_folder
         self.temp_folder = temp_folder
         self.max_file_size_bytes = max_file_size_bytes
-        self.link_original_on_copy_failure = link_original_on_copy_failure
         self.temp_folder.mkdir(parents=True, exist_ok=True)
 
     def plan_attachment_uploads(self, attachments: list[dict]) -> tuple[list[PlannedUpload], list[str]]:
@@ -85,8 +83,6 @@ class FileCopier:
                 warning = f"Attachment {plan.source_name} could not be copied: {exc}"
                 logger.warning("Attachment copy failed", extra={"attachment_name": plan.source_name, "error": str(exc)})
                 warnings.append(warning)
-                if self.link_original_on_copy_failure:
-                    copied.append(CopiedFile(plan.source_name, plan.content_url, None, plan.content_url))
         return copied, warnings
 
     async def copy_reference_url(self, content_url: str, destination_name: str) -> CopiedFile:
@@ -95,7 +91,7 @@ class FileCopier:
         size = drive_item.get("size")
         if size is not None and int(size) > self.max_file_size_bytes:
             raise ValueError(f"file is {size} bytes, above configured limit of {self.max_file_size_bytes} bytes")
-        if not drive_item.get("file"):
+        if "file" not in drive_item or drive_item.get("file") is None:
             raise ValueError("Graph driveItem is not a file")
 
         content, content_type = await self.graph.download_drive_item_from_share_url(content_url)
@@ -124,10 +120,13 @@ class FileCopier:
                     raise
                 safe_name = append_short_hash(safe_name, source_content_url or content)
                 uploaded = await self.graph.upload_file_to_channel_folder(self.files_folder, safe_name, content, content_type, conflict_behavior="fail")
+            web_url = uploaded.get("webUrl")
+            if not web_url:
+                raise ValueError(f"uploaded file {uploaded.get('name') or safe_name} did not return a webUrl")
             logger.info("Uploaded file to destination channel folder", extra={"file_name": uploaded.get("name") or safe_name})
             return CopiedFile(
                 name=uploaded.get("name") or safe_name,
-                web_url=uploaded.get("webUrl") or "",
+                web_url=web_url,
                 drive_item_id=uploaded.get("id"),
                 source_content_url=source_content_url,
             )

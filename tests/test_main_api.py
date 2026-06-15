@@ -40,8 +40,10 @@ class FakeGraph:
         self.fail_list = False
         self.fail_create_with_attachments = False
         self.fail_create_with_hosted_contents = False
+        self.fail_file_upload = False
         self.fail_get_message_ids = set()
         self.messages = {}
+        self.file_api_calls = []
         self.pages = [
             {
                 "messages": [
@@ -104,6 +106,28 @@ class FakeGraph:
             raise GraphAPIError(400, "bad attachment cards")
         return {"id": "new-message", "webUrl": "https://teams/repost"}
 
+    async def get_channel_files_folder(self, team_id, channel_id):
+        self.file_api_calls.append("filesFolder")
+        return {"id": "folder-id", "parentReference": {"driveId": "drive-id"}}
+
+    async def get_drive_item_from_share_url(self, content_url):
+        self.file_api_calls.append("driveItem")
+        return {"id": "source-drive-item", "name": "source.docx", "size": 12, "file": {}}
+
+    async def download_drive_item_from_share_url(self, content_url):
+        self.file_api_calls.append("download")
+        return b"file-content", "application/octet-stream"
+
+    async def upload_file_to_channel_folder(self, files_folder, file_name, content, content_type="application/octet-stream", conflict_behavior="fail"):
+        self.file_api_calls.append("upload")
+        if self.fail_file_upload:
+            raise GraphAPIError(403, "file upload denied")
+        return {
+            "id": "copied-file-1",
+            "name": file_name,
+            "webUrl": f"https://contoso.sharepoint.com/destination/{file_name}",
+        }
+
     def _message(self, message_id):
         created_times = {
             "msg-new": "2026-06-05T01:02:03Z",
@@ -152,7 +176,6 @@ class MainApiTests(unittest.TestCase):
         self.original_exception_list_path = main.settings.exception_list_path
         self.original_reverse_exception_list_path = main.settings.reverse_exception_list_path
         self.original_graph_base_url = main.settings.graph_base_url
-        self.original_app_base_url = main.settings.app_base_url
         self.original_post_list_limit = main.settings.post_list_limit
         self.original_post_cache_max_refresh_pages = main.settings.post_cache_max_refresh_pages
         self.original_openai_api_key = main.settings.openai_api_key
@@ -175,7 +198,6 @@ class MainApiTests(unittest.TestCase):
         main.settings.exception_list_path = Path(self.temp_dir.name) / "exception-list.json"
         main.settings.reverse_exception_list_path = Path(self.temp_dir.name) / "exception-list-reverse.json"
         main.settings.graph_base_url = "https://graph.microsoft.com/v1.0"
-        main.settings.app_base_url = None
         main.settings.post_list_limit = 25
         main.settings.post_cache_max_refresh_pages = 3
         main.settings.openai_api_key = "openai-key"
@@ -193,7 +215,6 @@ class MainApiTests(unittest.TestCase):
         main.settings.exception_list_path = self.original_exception_list_path
         main.settings.reverse_exception_list_path = self.original_reverse_exception_list_path
         main.settings.graph_base_url = self.original_graph_base_url
-        main.settings.app_base_url = self.original_app_base_url
         main.settings.post_list_limit = self.original_post_list_limit
         main.settings.post_cache_max_refresh_pages = self.original_post_cache_max_refresh_pages
         main.settings.openai_api_key = self.original_openai_api_key
@@ -910,12 +931,12 @@ class MainApiTests(unittest.TestCase):
         uuid.UUID(attachment["id"])
         self.assertIn(f'<attachment id="{attachment["id"]}"></attachment>', body)
         self.assertEqual(attachment["contentType"], "reference")
-        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/source.docx")
+        self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/destination/source.docx")
         self.assertEqual(response.json()["record"]["source_key"], "source-team|19:source@thread.tacv2|msg-1|translation:zh-Hans")
-        self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "attached_reference")
+        self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "copied_reference_attached")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["id"], attachment["id"])
 
-    def test_create_repost_fallback_links_use_cached_source_url_and_store_graph_diagnostics(self) -> None:
+    def test_create_repost_aborts_without_history_when_graph_rejects_hosted_content(self) -> None:
         cache = PostCache(main.settings.post_cache_path)
         cache.upsert_posts("source-team", "19:source@thread.tacv2", [self._cached_post("msg-1", "2026-06-01T01:02:03Z")])
         cache.upsert_translation(
@@ -933,20 +954,20 @@ class MainApiTests(unittest.TestCase):
 
         response = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.graph.create_calls, 2)
-        fallback_body = self.graph.created_payloads[1]["body"]["content"]
-        self.assertIn('<a href="https://teams/source/msg-1">Open original message for embedded image 1</a>', fallback_body)
-        self.assertNotIn('href="#"', fallback_body)
-        record = response.json()["record"]
-        self.assertEqual(record["inline_image_statuses"][0]["status"], "omitted_from_repost")
-        diagnostics = record["inline_image_diagnostics"][0]
-        self.assertEqual(diagnostics["status"], "graph_rejected_hosted_contents")
-        self.assertEqual(diagnostics["image_count"], 1)
-        self.assertEqual(diagnostics["content_types"], ["image/png"])
-        self.assertEqual(diagnostics["byte_sizes"], [11])
-        self.assertEqual(diagnostics["response_body"]["accessToken"], "[redacted]")
-        self.assertEqual(diagnostics["response_body"]["contentBytes"], "[redacted]")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "bad hosted content")
+        self.assertEqual(self.graph.create_calls, 1)
+        self.assertIn("hostedContents", self.graph.created_payloads[0])
+        self.assertNotIn("Open embedded image", self.graph.created_payloads[0]["body"]["content"])
+        self.assertNotIn("Open original message for embedded image", self.graph.created_payloads[0]["body"]["content"])
+        self.assertIsNone(
+            RepostHistory(main.settings.repost_history_path).get(
+                "source-team",
+                "19:source@thread.tacv2",
+                "msg-1",
+                "zh-Hans",
+            )
+        )
 
     def test_reverse_repost_uses_cached_english_translation_and_posts_to_original_source_channel(self) -> None:
         cache = PostCache(main.settings.post_cache_path)
@@ -990,7 +1011,11 @@ class MainApiTests(unittest.TestCase):
             "19:source@thread.tacv2",
             "msg-1",
             "zh-Hans",
-            {"subject": "Chinese subject", "body_html": "<p>你好</p>", "body_preview": "你好"},
+            {
+                "subject": "Chinese subject",
+                "body_html": '<p>你好 <img src="/api/flows/forward/posts/msg-1/images/1"></p>',
+                "body_preview": "你好",
+            },
         )
 
         repost_response = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})
@@ -1050,7 +1075,11 @@ class MainApiTests(unittest.TestCase):
             "19:source@thread.tacv2",
             "msg-1",
             "zh-Hans",
-            {"subject": "Chinese subject", "body_html": "<p>你好</p>", "body_preview": "你好"},
+            {
+                "subject": "Chinese subject",
+                "body_html": '<p>你好 <img src="/api/flows/forward/posts/msg-1/images/1"></p>',
+                "body_preview": "你好",
+            },
         )
         self.graph.fail_create_with_attachments = True
 
@@ -1058,7 +1087,7 @@ class MainApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "bad attachment cards")
-        self.assertEqual(self.graph.create_calls, 2)
+        self.assertEqual(self.graph.create_calls, 1)
         self.assertIsNone(
             RepostHistory(main.settings.repost_history_path).get(
                 "source-team",
@@ -1116,7 +1145,11 @@ class MainApiTests(unittest.TestCase):
             "19:source@thread.tacv2",
             "msg-1",
             "zh-Hans",
-            {"subject": "Chinese subject", "body_html": "<p>你好</p>", "body_preview": "你好"},
+            {
+                "subject": "Chinese subject",
+                "body_html": '<p>你好 <img src="/api/flows/forward/posts/msg-1/images/1"></p>',
+                "body_preview": "你好",
+            },
         )
         RepostHistory(main.settings.repost_history_path).upsert(
             {
@@ -1140,7 +1173,11 @@ class MainApiTests(unittest.TestCase):
             "19:source@thread.tacv2",
             "msg-1",
             "zh-Hans",
-            {"subject": "Translated msg-1", "body_html": "<p>Ni hao</p>", "body_preview": "Ni hao"},
+            {
+                "subject": "Translated msg-1",
+                "body_html": '<p>Ni hao <img src="/api/flows/forward/posts/msg-1/images/1"></p>',
+                "body_preview": "Ni hao",
+            },
         )
 
         first = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})

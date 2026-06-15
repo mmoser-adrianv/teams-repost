@@ -47,13 +47,6 @@ class HostedContentUpload:
 
 
 @dataclass(frozen=True)
-class LinkReplacement:
-    occurrence: int
-    href: str
-    label: str
-
-
-@dataclass(frozen=True)
 class ReferenceAttachment:
     id: str
     name: str
@@ -96,44 +89,31 @@ def replace_hosted_content_with_temporary_refs(
     uploads: Iterable[HostedContentUpload],
 ) -> str:
     replacements = {upload.occurrence: f"../hostedContents/{upload.temporary_id}/$value" for upload in uploads}
-    return _rewrite_html(body_html, img_src_replacements=replacements, link_replacements={})
+    return _rewrite_html(body_html, img_src_replacements=replacements)
 
 
 def replace_hosted_content_refs(
     body_html: str,
     uploads: Iterable[HostedContentUpload],
-    links: Iterable[LinkReplacement],
 ) -> str:
     img_replacements = {upload.occurrence: f"../hostedContents/{upload.temporary_id}/$value" for upload in uploads}
-    link_replacements = {link.occurrence: link for link in links}
-    return _rewrite_html(body_html, img_src_replacements=img_replacements, link_replacements=link_replacements)
+    return _rewrite_html(body_html, img_src_replacements=img_replacements)
 
 
 def replace_display_image_refs(
     body_html: str,
     uploads: Iterable[HostedContentUpload],
-    links: Iterable[LinkReplacement],
 ) -> str:
     img_replacements = {upload.occurrence: f"../hostedContents/{upload.temporary_id}/$value" for upload in uploads}
-    link_replacements = {link.occurrence: link for link in links}
     return _rewrite_html(
         body_html,
         img_src_replacements=img_replacements,
-        link_replacements=link_replacements,
         image_ref_detector=_display_image_occurrence_from_src,
     )
 
 
-def replace_hosted_content_with_links(
-    body_html: str,
-    links: Iterable[LinkReplacement],
-) -> str:
-    replacements = {link.occurrence: link for link in links}
-    return _rewrite_html(body_html, img_src_replacements={}, link_replacements=replacements)
-
-
 def strip_attachment_placeholders(body_html: str) -> str:
-    return _rewrite_html(body_html, img_src_replacements={}, link_replacements={}, strip_attachments=True)
+    return _rewrite_html(body_html, img_src_replacements={}, strip_attachments=True)
 
 
 def append_attachment_placeholders(body_html: str, attachments: Iterable[ReferenceAttachment]) -> str:
@@ -323,7 +303,6 @@ class _RewritingParser(HTMLParser):
     def __init__(
         self,
         img_src_replacements: dict[int, str],
-        link_replacements: dict[int, LinkReplacement],
         strip_attachments: bool = False,
         image_ref_detector: Callable[[str | None], int | None] | None = None,
     ) -> None:
@@ -331,7 +310,6 @@ class _RewritingParser(HTMLParser):
         self.output: list[str] = []
         self._occurrence = 0
         self._img_src_replacements = img_src_replacements
-        self._link_replacements = link_replacements
         self._strip_attachments = strip_attachments
         self._image_ref_detector = image_ref_detector
         self._suppressed_attachment_depth = 0
@@ -394,16 +372,6 @@ class _RewritingParser(HTMLParser):
             elif self._image_ref_detector:
                 occurrence = self._image_ref_detector(src)
             if occurrence:
-                link_replacement = self._link_replacements.get(occurrence)
-                if link_replacement:
-                    self.output.append(
-                        '<a href="'
-                        + html.escape(link_replacement.href, quote=True)
-                        + '">'
-                        + html.escape(link_replacement.label)
-                        + "</a>"
-                    )
-                    return
                 new_src = self._img_src_replacements.get(occurrence)
                 if new_src:
                     attrs = _replace_attr(attrs, "src", new_src)
@@ -520,11 +488,10 @@ class _DisplaySanitizingParser(HTMLParser):
 def _rewrite_html(
     body_html: str,
     img_src_replacements: dict[int, str],
-    link_replacements: dict[int, LinkReplacement],
     strip_attachments: bool = False,
     image_ref_detector: Callable[[str | None], int | None] | None = None,
 ) -> str:
-    parser = _RewritingParser(img_src_replacements, link_replacements, strip_attachments, image_ref_detector)
+    parser = _RewritingParser(img_src_replacements, strip_attachments, image_ref_detector)
     parser.feed(body_html or "")
     parser.close()
     return "".join(parser.output)
