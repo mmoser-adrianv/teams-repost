@@ -52,6 +52,8 @@ GRAPH_SCOPES=offline_access ChannelMessage.Read.All ChannelMessage.Send
 
 `POST_CACHE_PATH` stores pulled source-channel posts separately from repost history. `POST_CACHE_MAX_REFRESH_PAGES` limits how many Microsoft Graph pages a refresh checks while looking for posts newer than the latest cached post.
 
+`APP_BASE_URL` is optional. When set to the externally reachable manager URL, fallback embedded-image links in reposts can point to the manager image download route. When omitted, fallback links point to the original Teams message.
+
 `EXCEPTION_LIST_PATH` stores English-side email addresses that should be skipped. `REVERSE_EXCEPTION_LIST_PATH` stores the separate Chinese-side list; when it is omitted, the app uses a sibling file named like `exception-list-reverse.json`. Each manager UI can add or remove addresses for its own side, and the matching posts API excludes cached or newly pulled posts whose available sender email matches that side's list.
 
 `OPENAI_API_KEY` enables the per-post translation button in the manager UI. The default page translates the configured English source channel to `OPENAI_TRANSLATION_TARGET` and reposts to the configured destination channel. The reverse page at `/reverse` reads the configured destination channel, translates posts to English (`en`), and reposts to the configured source channel. Translations are generated with `OPENAI_TRANSLATION_MODEL` and saved under each post in `POST_CACHE_PATH`, so already translated posts can be toggled without another OpenAI call. The manager Repost button posts the cached translation, not the original body; if the post is not translated yet, the UI translates it first.

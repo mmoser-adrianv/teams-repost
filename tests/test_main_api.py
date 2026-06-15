@@ -39,6 +39,7 @@ class FakeGraph:
         self.list_page_calls = []
         self.fail_list = False
         self.fail_create_with_attachments = False
+        self.fail_create_with_hosted_contents = False
         self.fail_get_message_ids = set()
         self.messages = {}
         self.pages = [
@@ -89,6 +90,16 @@ class FakeGraph:
         self.create_calls += 1
         self.created_destinations.append({"team_id": team_id, "channel_id": channel_id})
         self.created_payloads.append(payload)
+        if self.fail_create_with_hosted_contents and payload.get("hostedContents"):
+            raise GraphAPIError(
+                400,
+                "bad hosted content",
+                {
+                    "error": {"message": "Hosted content payload was rejected"},
+                    "accessToken": "must-not-be-stored",
+                    "contentBytes": "must-not-be-stored",
+                },
+            )
         if self.fail_create_with_attachments and payload.get("attachments"):
             raise GraphAPIError(400, "bad attachment cards")
         return {"id": "new-message", "webUrl": "https://teams/repost"}
@@ -141,6 +152,7 @@ class MainApiTests(unittest.TestCase):
         self.original_exception_list_path = main.settings.exception_list_path
         self.original_reverse_exception_list_path = main.settings.reverse_exception_list_path
         self.original_graph_base_url = main.settings.graph_base_url
+        self.original_app_base_url = main.settings.app_base_url
         self.original_post_list_limit = main.settings.post_list_limit
         self.original_post_cache_max_refresh_pages = main.settings.post_cache_max_refresh_pages
         self.original_openai_api_key = main.settings.openai_api_key
@@ -163,6 +175,7 @@ class MainApiTests(unittest.TestCase):
         main.settings.exception_list_path = Path(self.temp_dir.name) / "exception-list.json"
         main.settings.reverse_exception_list_path = Path(self.temp_dir.name) / "exception-list-reverse.json"
         main.settings.graph_base_url = "https://graph.microsoft.com/v1.0"
+        main.settings.app_base_url = None
         main.settings.post_list_limit = 25
         main.settings.post_cache_max_refresh_pages = 3
         main.settings.openai_api_key = "openai-key"
@@ -180,6 +193,7 @@ class MainApiTests(unittest.TestCase):
         main.settings.exception_list_path = self.original_exception_list_path
         main.settings.reverse_exception_list_path = self.original_reverse_exception_list_path
         main.settings.graph_base_url = self.original_graph_base_url
+        main.settings.app_base_url = self.original_app_base_url
         main.settings.post_list_limit = self.original_post_list_limit
         main.settings.post_cache_max_refresh_pages = self.original_post_cache_max_refresh_pages
         main.settings.openai_api_key = self.original_openai_api_key
@@ -900,6 +914,39 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.json()["record"]["source_key"], "source-team|19:source@thread.tacv2|msg-1|translation:zh-Hans")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "attached_reference")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["id"], attachment["id"])
+
+    def test_create_repost_fallback_links_use_cached_source_url_and_store_graph_diagnostics(self) -> None:
+        cache = PostCache(main.settings.post_cache_path)
+        cache.upsert_posts("source-team", "19:source@thread.tacv2", [self._cached_post("msg-1", "2026-06-01T01:02:03Z")])
+        cache.upsert_translation(
+            "source-team",
+            "19:source@thread.tacv2",
+            "msg-1",
+            "zh-Hans",
+            {
+                "subject": "Chinese subject",
+                "body_html": '<p><strong>你好</strong> <img src="/api/flows/forward/posts/msg-1/images/1"></p>',
+                "body_preview": "你好",
+            },
+        )
+        self.graph.fail_create_with_hosted_contents = True
+
+        response = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.graph.create_calls, 2)
+        fallback_body = self.graph.created_payloads[1]["body"]["content"]
+        self.assertIn('<a href="https://teams/source/msg-1">Open original message for embedded image 1</a>', fallback_body)
+        self.assertNotIn('href="#"', fallback_body)
+        record = response.json()["record"]
+        self.assertEqual(record["inline_image_statuses"][0]["status"], "omitted_from_repost")
+        diagnostics = record["inline_image_diagnostics"][0]
+        self.assertEqual(diagnostics["status"], "graph_rejected_hosted_contents")
+        self.assertEqual(diagnostics["image_count"], 1)
+        self.assertEqual(diagnostics["content_types"], ["image/png"])
+        self.assertEqual(diagnostics["byte_sizes"], [11])
+        self.assertEqual(diagnostics["response_body"]["accessToken"], "[redacted]")
+        self.assertEqual(diagnostics["response_body"]["contentBytes"], "[redacted]")
 
     def test_reverse_repost_uses_cached_english_translation_and_posts_to_original_source_channel(self) -> None:
         cache = PostCache(main.settings.post_cache_path)

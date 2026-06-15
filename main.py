@@ -525,6 +525,7 @@ async def _create_repost_with_token(flow: RepostFlow, source_message_id: str, ta
         source_channel_thread_id=source.channel_id,
         message_id=source_message_id,
         parent_message_id=None,
+        raw_url=cached_post.get("web_url"),
     )
     async with _graph(token) as graph:
         try:

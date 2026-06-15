@@ -25,6 +25,12 @@ class HostedContentRef:
 
 
 @dataclass(frozen=True)
+class DisplayImageRef:
+    occurrence: int
+    src: str
+
+
+@dataclass(frozen=True)
 class HostedContentUpload:
     occurrence: int
     original_id: str
@@ -73,6 +79,13 @@ class ReferenceAttachment:
 
 def find_hosted_content_refs(body_html: str) -> list[HostedContentRef]:
     parser = _HostedContentParser()
+    parser.feed(body_html or "")
+    parser.close()
+    return parser.refs
+
+
+def find_display_image_refs(body_html: str) -> list[DisplayImageRef]:
+    parser = _DisplayImageRefParser()
     parser.feed(body_html or "")
     parser.close()
     return parser.refs
@@ -282,6 +295,25 @@ class _HostedContentParser(HTMLParser):
         if hosted_id:
             self._occurrence += 1
             self.refs.append(HostedContentRef(self._occurrence, hosted_id, src or ""))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+
+class _DisplayImageRefParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.refs: list[DisplayImageRef] = []
+        self._seen: set[int] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        src = _attr_value(attrs, "src")
+        occurrence = _display_image_occurrence_from_src(src)
+        if occurrence and occurrence not in self._seen:
+            self._seen.add(occurrence)
+            self.refs.append(DisplayImageRef(occurrence, src or ""))
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)

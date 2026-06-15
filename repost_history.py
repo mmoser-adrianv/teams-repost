@@ -93,6 +93,7 @@ def build_repost_record(
         "attachment_links": report.get("attachment_links") or [],
         "attachment_statuses": report.get("attachment_statuses") or [],
         "inline_image_statuses": report.get("inline_image_statuses") or [],
+        "inline_image_diagnostics": report.get("inline_image_diagnostics") or [],
         "status": "reposted",
         "manual": False,
         "warnings": report.get("warnings") or [],
