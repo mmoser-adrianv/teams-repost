@@ -363,6 +363,10 @@ function skippedPostMessages(cache) {
   if (graphErrorCount) {
     messages.push(`Skipped ${graphErrorCount} post${graphErrorCount === 1 ? "" : "s"} Microsoft Graph could not load.`);
   }
+  const emptyContentCount = cache?.posts_skipped_by_empty_content || 0;
+  if (emptyContentCount) {
+    messages.push(`Skipped ${emptyContentCount} post${emptyContentCount === 1 ? "" : "s"} with no presentable content.`);
+  }
   return messages;
 }
 

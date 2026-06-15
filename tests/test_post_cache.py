@@ -37,9 +37,9 @@ class PostCacheTests(unittest.TestCase):
             "team-1",
             "channel-1",
             [
-                {"id": "msg-3", "created_date_time": "2026-06-06T01:00:00Z"},
-                {"id": "msg-2", "created_date_time": "2026-06-05T01:00:00Z"},
-                {"id": "msg-1", "created_date_time": "2026-06-04T01:00:00Z"},
+                {"id": "msg-3", "created_date_time": "2026-06-06T01:00:00Z", "body_html": "<p>Three</p>"},
+                {"id": "msg-2", "created_date_time": "2026-06-05T01:00:00Z", "body_html": "<p>Two</p>"},
+                {"id": "msg-1", "created_date_time": "2026-06-04T01:00:00Z", "body_html": "<p>One</p>"},
             ],
         )
 
@@ -48,6 +48,50 @@ class PostCacheTests(unittest.TestCase):
         self.assertEqual([post["id"] for post in page["posts"]], ["msg-2"])
         self.assertEqual(page["next_offset"], 2)
         self.assertEqual(page["total"], 3)
+
+    def test_pages_exclude_unpresentable_cached_posts(self) -> None:
+        self.cache.upsert_posts(
+            "team-1",
+            "channel-1",
+            [
+                {
+                    "id": "empty-msg",
+                    "created_date_time": "2026-06-05T01:00:00Z",
+                    "subject": "Teams message",
+                    "body_html": "",
+                    "body_preview": "",
+                    "attachments": [],
+                    "embedded_images": [],
+                },
+                {
+                    "id": "real-msg",
+                    "created_date_time": "2026-06-04T01:00:00Z",
+                    "body_html": "<p>Original body</p>",
+                    "attachments": [],
+                    "embedded_images": [],
+                },
+            ],
+        )
+
+        page = self.cache.page_posts("team-1", "channel-1", offset=0, limit=10)
+
+        self.assertEqual([post["id"] for post in page["posts"]], ["real-msg"])
+        self.assertEqual(page["total"], 1)
+
+    def test_pages_keep_attachment_only_and_image_only_cached_posts(self) -> None:
+        self.cache.upsert_posts(
+            "team-1",
+            "channel-1",
+            [
+                {"id": "attachment-msg", "created_date_time": "2026-06-05T01:00:00Z", "attachments": [{"name": "source.docx"}]},
+                {"id": "image-msg", "created_date_time": "2026-06-04T01:00:00Z", "embedded_images": [{"occurrence": 1}]},
+            ],
+        )
+
+        page = self.cache.page_posts("team-1", "channel-1", offset=0, limit=10)
+
+        self.assertEqual([post["id"] for post in page["posts"]], ["attachment-msg", "image-msg"])
+        self.assertEqual(page["total"], 2)
 
     def test_pages_exclude_cached_posts_by_body_prefix(self) -> None:
         self.cache.upsert_posts(

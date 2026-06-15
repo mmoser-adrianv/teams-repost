@@ -39,8 +39,10 @@ class AuthScopeTests(unittest.TestCase):
 class FakeMsalApp:
     def __init__(self, cache=None) -> None:
         self.cache = cache
+        self.initiated_scopes = None
 
     def initiate_auth_code_flow(self, scopes, **kwargs):
+        self.initiated_scopes = scopes
         return {
             "auth_uri": (
                 "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize?"
@@ -55,11 +57,13 @@ class FakeMsalApp:
 class FakeSilentApp:
     def __init__(self, result) -> None:
         self.result = result
+        self.silent_scopes = None
 
     def get_accounts(self):
         return [{"home_account_id": "account-1"}]
 
     def acquire_token_silent(self, scopes, account):
+        self.silent_scopes = scopes
         return self.result
 
 
@@ -94,6 +98,30 @@ class LoginFlowTests(unittest.TestCase):
         params = parse_qs(urlparse(auth_uri).query)
         self.assertEqual(params["domain_hint"], [AUTH_DOMAIN_HINT])
 
+    def test_login_flow_filters_msal_reserved_scopes(self) -> None:
+        original_build_msal_app = auth.build_msal_app
+        fake_app = FakeMsalApp()
+        auth.build_msal_app = lambda settings, cache=None: fake_app
+        self.addCleanup(lambda: setattr(auth, "build_msal_app", original_build_msal_app))
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/auth/login",
+                "headers": [],
+                "session": {},
+            }
+        )
+        settings = Settings(
+            AZURE_TENANT_ID="tenant",
+            AZURE_CLIENT_ID="client",
+            GRAPH_SCOPES="offline_access ChannelMessage.Read.All ChannelMessage.Send",
+        )
+
+        create_login_flow(request, settings)
+
+        self.assertEqual(fake_app.initiated_scopes, ["ChannelMessage.Read.All", "ChannelMessage.Send"])
+
 
 class PersistentTokenCacheTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -102,6 +130,7 @@ class PersistentTokenCacheTests(unittest.TestCase):
         self.settings = Settings(
             AZURE_TENANT_ID="tenant",
             AZURE_CLIENT_ID="client",
+            GRAPH_SCOPES="offline_access ChannelMessage.Read.All ChannelMessage.Send",
             MSAL_TOKEN_CACHE_PATH=Path(self.temp_dir.name) / "msal-cache.json",
         )
         _AUTH_FLOWS.clear()
@@ -137,9 +166,10 @@ class PersistentTokenCacheTests(unittest.TestCase):
         original_load = auth.load_persistent_token_cache
         original_save = auth.save_persistent_token_cache
         original_build = auth.build_msal_app
+        fake_app = FakeSilentApp({"access_token": "token", "expires_in": 3600})
         auth.load_persistent_token_cache = lambda settings: FakeCache()
         auth.save_persistent_token_cache = lambda settings, cache: saved.append(cache.serialize())
-        auth.build_msal_app = lambda settings, cache=None: FakeSilentApp({"access_token": "token", "expires_in": 3600})
+        auth.build_msal_app = lambda settings, cache=None: fake_app
         self.addCleanup(lambda: setattr(auth, "load_persistent_token_cache", original_load))
         self.addCleanup(lambda: setattr(auth, "save_persistent_token_cache", original_save))
         self.addCleanup(lambda: setattr(auth, "build_msal_app", original_build))
@@ -147,6 +177,7 @@ class PersistentTokenCacheTests(unittest.TestCase):
         token = acquire_persistent_access_token(self.settings)
 
         self.assertEqual(token, "token")
+        self.assertEqual(fake_app.silent_scopes, ["ChannelMessage.Read.All", "ChannelMessage.Send"])
         self.assertEqual(saved, ['{"changed": true}'])
 
     def test_missing_persistent_cache_requires_reauth(self) -> None:

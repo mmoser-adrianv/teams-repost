@@ -1,0 +1,27 @@
+services:
+  web:
+    build: .
+    image: teams-repost:local
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./.data:/app/.data
+    restart: unless-stopped
+
+  automation:
+    build: .
+    image: teams-repost:local
+    env_file:
+      - .env
+    volumes:
+      - ./.data:/app/.data
+    command: >
+      sh -c "while true; do
+        python -m automation_worker --once;
+        sleep 300;
+      done"
+    depends_on:
+      - web
+    restart: unless-stopped

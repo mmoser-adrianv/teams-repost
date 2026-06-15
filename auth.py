@@ -14,6 +14,7 @@ from settings import DEFAULT_GRAPH_SCOPES, Settings
 
 GRAPH_SCOPES = list(DEFAULT_GRAPH_SCOPES)
 AUTH_DOMAIN_HINT = "mmoser.com"
+MSAL_RESERVED_SCOPES = frozenset({"offline_access", "openid", "profile"})
 
 _AUTH_FLOWS: dict[str, dict[str, Any]] = {}
 _TOKEN_CACHES: dict[str, dict[str, Any]] = {}
@@ -93,7 +94,7 @@ def acquire_persistent_access_token(settings: Settings) -> str:
     if not accounts:
         raise PersistentTokenCacheMissing("No Microsoft account found in token cache. Sign in again.")
 
-    result = app.acquire_token_silent(settings.graph_scope_list, account=accounts[0])
+    result = app.acquire_token_silent(_msal_graph_scopes(settings), account=accounts[0])
     if "access_token" not in result:
         detail = result.get("error_description") if isinstance(result, dict) else None
         raise PersistentTokenCacheMissing(detail or "Microsoft token could not be refreshed. Sign in again.")
@@ -115,7 +116,7 @@ def create_login_flow(request: Request, settings: Settings) -> str:
     cache = msal.SerializableTokenCache()
     app = build_msal_app(settings, cache)
     flow = app.initiate_auth_code_flow(
-        settings.graph_scope_list,
+        _msal_graph_scopes(settings),
         redirect_uri=settings.redirect_uri,
         domain_hint=AUTH_DOMAIN_HINT,
     )
@@ -164,7 +165,7 @@ def get_access_token(request: Request, settings: Settings) -> str:
     if not accounts:
         raise HTTPException(status_code=401, detail="No Microsoft account found in token cache. Open /auth/login again.")
 
-    result = app.acquire_token_silent(settings.graph_scope_list, account=accounts[0])
+    result = app.acquire_token_silent(_msal_graph_scopes(settings), account=accounts[0])
     if "access_token" not in result:
         raise HTTPException(status_code=401, detail="Microsoft token expired or could not be refreshed. Open /auth/login again.")
 
@@ -191,3 +192,7 @@ def auth_status(request: Request, settings: Settings) -> dict[str, Any]:
     session_id = request.session.get("session_id")
     signed_in = bool(session_id and (session_id in _TOKEN_CACHES or has_persistent_account(settings)))
     return {"signed_in": signed_in}
+
+
+def _msal_graph_scopes(settings: Settings) -> list[str]:
+    return [scope for scope in settings.graph_scope_list if scope not in MSAL_RESERVED_SCOPES]

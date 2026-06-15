@@ -476,6 +476,40 @@ class MainApiTests(unittest.TestCase):
         cache = PostCache(main.settings.post_cache_path)
         self.assertEqual(cache.list_posts("source-team", "19:source@thread.tacv2"), [])
 
+    def test_refresh_skips_posts_with_no_presentable_content(self) -> None:
+        self.graph.pages = [{"messages": [{"id": "empty-msg", "subject": "Teams message"}], "next_link": None}]
+        self.graph.messages["empty-msg"] = {
+            "subject": "Teams message",
+            "from": None,
+            "body": {"contentType": "html", "content": ""},
+            "attachments": [],
+        }
+
+        response = self.client.get("/api/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["posts"], [])
+        self.assertEqual(payload["cache"]["new_posts_saved"], 0)
+        self.assertEqual(payload["cache"]["posts_skipped_by_empty_content"], 1)
+        cache = PostCache(main.settings.post_cache_path)
+        self.assertEqual(cache.list_posts("source-team", "19:source@thread.tacv2"), [])
+
+    def test_refresh_keeps_image_only_posts(self) -> None:
+        self.graph.pages = [{"messages": [{"id": "image-msg"}], "next_link": None}]
+        self.graph.messages["image-msg"] = {
+            "subject": None,
+            "body": {"contentType": "html", "content": '<p><img src="../hostedContents/image-1/$value"></p>'},
+            "attachments": [],
+        }
+
+        response = self.client.get("/api/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual([post["id"] for post in payload["posts"]], ["image-msg"])
+        self.assertEqual(payload["cache"]["posts_skipped_by_empty_content"], 0)
+
     def test_reverse_refresh_skips_posts_from_reverse_exception_email(self) -> None:
         ExceptionList(main.settings.exception_list_path).add("alex@example.com")
         ExceptionList(main.settings.reverse_exception_list_path).add("chen@example.com")
@@ -516,6 +550,29 @@ class MainApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([post["id"] for post in response.json()["posts"]], ["msg-2"])
+
+    def test_cached_posts_with_no_presentable_content_are_excluded_from_pages(self) -> None:
+        PostCache(main.settings.post_cache_path).upsert_posts(
+            "source-team",
+            "19:source@thread.tacv2",
+            [
+                {
+                    **self._cached_post("empty-msg", "2026-06-02T01:02:03Z"),
+                    "subject": "Teams message",
+                    "author": None,
+                    "body_html": "",
+                    "body_preview": "",
+                    "attachments": [],
+                    "embedded_images": [],
+                },
+                self._cached_post("real-msg", "2026-06-01T01:02:03Z"),
+            ],
+        )
+
+        response = self.client.get("/api/posts?limit=10&refresh=false")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([post["id"] for post in response.json()["posts"]], ["real-msg"])
 
     def test_cached_reverse_posts_from_reverse_exception_email_are_excluded_from_pages(self) -> None:
         PostCache(main.settings.post_cache_path).upsert_posts(
@@ -576,6 +633,30 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(len(self.graph.list_page_calls), 1)
         self.assertEqual(response.json()["cache"]["new_posts_saved"], 1)
         self.assertEqual([post["id"] for post in cache.list_posts("source-team", "19:source@thread.tacv2")], ["msg-new", "msg-1"])
+
+    def test_cold_cache_refresh_continues_across_pages(self) -> None:
+        self.graph.pages = [
+            {
+                "messages": [{"id": "msg-newer", "body": {"contentType": "html", "content": "<p>Newer</p>"}}],
+                "next_link": f"{main.settings.graph_base_url}/next-page",
+            },
+            {
+                "messages": [{"id": "msg-older", "body": {"contentType": "html", "content": "<p>Older</p>"}}],
+                "next_link": None,
+            },
+        ]
+        self.graph.messages["msg-newer"] = {"createdDateTime": "2026-06-02T01:02:03Z"}
+        self.graph.messages["msg-older"] = {"createdDateTime": "2026-06-01T01:02:03Z"}
+
+        response = self.client.get("/api/posts?limit=10&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.graph.list_page_calls), 2)
+        self.assertEqual(self.graph.list_page_calls[1]["page_url"], f"{main.settings.graph_base_url}/next-page")
+        self.assertEqual(self.graph.get_message_calls, ["msg-newer", "msg-older"])
+        self.assertEqual(response.json()["cache"]["new_posts_saved"], 2)
+        cache = PostCache(main.settings.post_cache_path)
+        self.assertEqual([post["id"] for post in cache.list_posts("source-team", "19:source@thread.tacv2")], ["msg-newer", "msg-older"])
 
     def test_cache_only_posts_still_merge_repost_status(self) -> None:
         PostCache(main.settings.post_cache_path).upsert_posts(
@@ -737,6 +818,26 @@ class MainApiTests(unittest.TestCase):
         response = self.client.post("/api/posts/missing/translations", json={"target_language": "zh-Hans"})
 
         self.assertEqual(response.status_code, 404)
+
+    def test_translate_cached_post_with_no_presentable_content_returns_conflict(self) -> None:
+        PostCache(main.settings.post_cache_path).upsert_posts(
+            "source-team",
+            "19:source@thread.tacv2",
+            [
+                {
+                    **self._cached_post("empty-msg", "2026-06-01T01:02:03Z"),
+                    "body_html": "",
+                    "body_preview": "",
+                    "attachments": [],
+                    "embedded_images": [],
+                }
+            ],
+        )
+
+        response = self.client.post("/api/posts/empty-msg/translations", json={"target_language": "zh-Hans"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.translation_calls, [])
 
     def test_translate_missing_openai_api_key_returns_service_unavailable(self) -> None:
         PostCache(main.settings.post_cache_path).upsert_posts(
@@ -928,6 +1029,34 @@ class MainApiTests(unittest.TestCase):
         )
 
         response = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.graph.create_calls, 0)
+
+    def test_create_repost_with_no_presentable_content_returns_conflict(self) -> None:
+        cache = PostCache(main.settings.post_cache_path)
+        cache.upsert_posts(
+            "source-team",
+            "19:source@thread.tacv2",
+            [
+                {
+                    **self._cached_post("empty-msg", "2026-06-01T01:02:03Z"),
+                    "body_html": "",
+                    "body_preview": "",
+                    "attachments": [],
+                    "embedded_images": [],
+                }
+            ],
+        )
+        cache.upsert_translation(
+            "source-team",
+            "19:source@thread.tacv2",
+            "empty-msg",
+            "zh-Hans",
+            {"subject": "Teams message", "body_html": "", "body_preview": ""},
+        )
+
+        response = self.client.post("/api/reposts", json={"source_message_id": "empty-msg"})
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(self.graph.create_calls, 0)

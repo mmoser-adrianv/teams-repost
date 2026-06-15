@@ -187,6 +187,87 @@ class AutomationWorkerTests(unittest.TestCase):
         self.assertEqual(result["flows"][0]["already_reposted"], 1)
         self.assertEqual(self.graph.create_calls, 0)
 
+    def test_cached_posts_are_automated_oldest_to_newest(self) -> None:
+        cache = PostCache(app_main.settings.post_cache_path)
+        cache.upsert_posts(
+            "source-team",
+            "19:source@thread.tacv2",
+            [
+                _cached_post("newest-msg", "2026-06-10T03:00:00Z"),
+                _cached_post("oldest-msg", "2026-06-10T01:00:00Z"),
+                _cached_post("middle-msg", "2026-06-10T02:00:00Z"),
+            ],
+        )
+        app_main.settings.automation_flows = "forward"
+        app_main.settings.automation_max_posts_per_flow = 2
+        self.graph.pages_by_team = {"source-team": []}
+
+        result = asyncio.run(automation_worker.run_once())
+
+        self.assertEqual(result["flows"][0]["checked"], 2)
+        self.assertEqual(
+            self.translation_calls,
+            [
+                {"message_id": "oldest-msg", "target_language": "zh-Hans"},
+                {"message_id": "middle-msg", "target_language": "zh-Hans"},
+            ],
+        )
+
+    def test_already_reposted_oldest_posts_do_not_consume_automation_limit(self) -> None:
+        cache = PostCache(app_main.settings.post_cache_path)
+        cache.upsert_posts(
+            "source-team",
+            "19:source@thread.tacv2",
+            [
+                _cached_post("newest-msg", "2026-06-10T03:00:00Z"),
+                _cached_post("oldest-msg", "2026-06-10T01:00:00Z"),
+                _cached_post("middle-msg", "2026-06-10T02:00:00Z"),
+            ],
+        )
+        RepostHistory(app_main.settings.repost_history_path).upsert(
+            {
+                "source_key": "source-team|19:source@thread.tacv2|oldest-msg|translation:zh-Hans",
+                "source": {"team_id": "source-team", "channel_id": "19:source@thread.tacv2", "message_id": "oldest-msg"},
+                "destination": {"team_id": "dest-team", "channel_id": "19:dest@thread.tacv2", "message_id": "old"},
+                "translation": {"target_language": "zh-Hans"},
+            }
+        )
+        app_main.settings.automation_flows = "forward"
+        app_main.settings.automation_max_posts_per_flow = 2
+        self.graph.pages_by_team = {"source-team": []}
+
+        result = asyncio.run(automation_worker.run_once())
+
+        self.assertEqual(result["flows"][0]["already_reposted"], 1)
+        self.assertEqual(
+            self.translation_calls,
+            [
+                {"message_id": "middle-msg", "target_language": "zh-Hans"},
+                {"message_id": "newest-msg", "target_language": "zh-Hans"},
+            ],
+        )
+
+    def test_cached_posts_with_no_presentable_content_are_not_automated(self) -> None:
+        cache = PostCache(app_main.settings.post_cache_path)
+        empty_post = {
+            **_cached_post("empty-msg"),
+            "subject": "Teams message",
+            "author": None,
+            "body_html": "",
+            "body_preview": "",
+            "attachments": [],
+            "embedded_images": [],
+        }
+        cache.upsert_posts("source-team", "19:source@thread.tacv2", [empty_post])
+        app_main.settings.automation_flows = "forward"
+        self.graph.pages_by_team = {"source-team": []}
+
+        result = asyncio.run(automation_worker.run_once())
+
+        self.assertEqual(result["flows"][0]["checked"], 0)
+        self.assertEqual(self.translation_calls, [])
+        self.assertEqual(self.graph.create_calls, 0)
+
     def test_repost_failure_does_not_write_success_history(self) -> None:
         cache = PostCache(app_main.settings.post_cache_path)
         post = _cached_post("forward-msg")
@@ -218,13 +299,13 @@ class AutomationWorkerTests(unittest.TestCase):
         self.assertTrue(app_main.settings.automation_lock_path.exists())
 
 
-def _cached_post(message_id: str) -> dict:
+def _cached_post(message_id: str, created_date_time: str = "2026-06-10T01:02:03Z") -> dict:
     return {
         "id": message_id,
         "subject": f"Cached {message_id}",
         "author": "Alex",
         "author_email": "alex@example.com",
-        "created_date_time": "2026-06-10T01:02:03Z",
+        "created_date_time": created_date_time,
         "web_url": f"https://teams/source/{message_id}",
         "body_html": "<p>Cached body</p>",
         "body_preview": "Cached body",

@@ -71,8 +71,11 @@ class PostCache:
         limit: int,
         excluded_author_emails: set[str] | None = None,
         excluded_body_prefixes: tuple[str, ...] = (),
+        exclude_unpresentable: bool = True,
     ) -> dict[str, Any]:
         posts = self.list_posts(source_team_id, source_channel_id)
+        if exclude_unpresentable:
+            posts = [post for post in posts if is_presentable_post(post)]
         if excluded_author_emails:
             posts = [post for post in posts if (post.get("author_email") or "").lower() not in excluded_author_emails]
         if excluded_body_prefixes:
@@ -167,3 +170,7 @@ def _cached_body_text(post: dict[str, Any]) -> str:
     body_preview = str(post.get("body_preview") or "")
     text = re.sub(r"<[^>]+>", " ", body_html) if body_html else body_preview
     return re.sub(r"[\s\u00a0]+", " ", unescape(text)).strip()
+
+
+def is_presentable_post(post: dict[str, Any]) -> bool:
+    return bool(_cached_body_text(post) or post.get("attachments") or post.get("embedded_images"))

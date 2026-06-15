@@ -38,7 +38,7 @@ from message_rebuilder import (
     sanitize_body_html_for_display,
     strip_attachment_placeholders,
 )
-from post_cache import PostCache
+from post_cache import PostCache, is_presentable_post
 from repost_history import RepostHistory, build_manual_repost_record, build_repost_record
 from settings import get_settings
 from teams_url_parser import TeamsMessageLink
@@ -276,6 +276,8 @@ async def _translate_post_for_flow(
     post = cache.get_post(source.team_id, source.channel_id, source_message_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Cached post was not found")
+    if not is_presentable_post(post):
+        raise HTTPException(status_code=409, detail="Cached post has no presentable content to translate")
 
     target_language = payload.target_language or flow.target_language
     existing = (post.get("translations") or {}).get(target_language)
@@ -452,6 +454,7 @@ async def _list_posts_for_flow(
         "posts_skipped_by_exception": 0,
         "posts_skipped_by_body_prefix": 0,
         "posts_skipped_by_graph_error": 0,
+        "posts_skipped_by_empty_content": 0,
         "partial_refresh": False,
         "refresh_failed": False,
         "refresh_error": None,
@@ -510,6 +513,8 @@ async def _create_repost_with_token(flow: RepostFlow, source_message_id: str, ta
     cached_post = cache.get_post(source.team_id, source.channel_id, source_message_id)
     if cached_post is None:
         raise HTTPException(status_code=404, detail="Cached post was not found")
+    if not is_presentable_post(cached_post):
+        raise HTTPException(status_code=409, detail="Cached post has no presentable content to repost")
     translation = (cached_post.get("translations") or {}).get(target_language)
     if translation is None:
         raise HTTPException(status_code=409, detail=f"Translate this post to {target_language} before reposting")
@@ -598,6 +603,7 @@ async def _refresh_post_cache(
     posts_skipped_by_exception = 0
     posts_skipped_by_body_prefix = 0
     posts_skipped_by_graph_error = 0
+    posts_skipped_by_empty_content = 0
     next_url: str | None = None
     pages_checked = 0
     reached_cached_post = False
@@ -624,12 +630,15 @@ async def _refresh_post_cache(
                 if _should_skip_body_prefix(message, flow.skipped_body_prefixes):
                     posts_skipped_by_body_prefix += 1
                     continue
+                if not _has_presentable_message_content(message):
+                    posts_skipped_by_empty_content += 1
+                    continue
                 if exceptions.contains(extract_author_email(message)):
                     posts_skipped_by_exception += 1
                     continue
                 new_posts.append(_cached_post_summary(message, image_route_prefix))
 
-        if reached_cached_post or not newest_cached_id or not page["next_link"]:
+        if reached_cached_post or not page["next_link"]:
             break
         next_url = page["next_link"]
     else:
@@ -642,6 +651,7 @@ async def _refresh_post_cache(
         "posts_skipped_by_exception": posts_skipped_by_exception,
         "posts_skipped_by_body_prefix": posts_skipped_by_body_prefix,
         "posts_skipped_by_graph_error": posts_skipped_by_graph_error,
+        "posts_skipped_by_empty_content": posts_skipped_by_empty_content,
         "partial_refresh": partial_refresh and not reached_cached_post,
         "refresh_failed": False,
         "refresh_error": None,
@@ -727,6 +737,10 @@ def _with_repost_status(post: dict, source: DestinationChannel, history: RepostH
 
 def _hosted_image_refs(message: dict):
     return find_hosted_content_refs(strip_attachment_placeholders(normalize_body_to_html(message)))
+
+
+def _has_presentable_message_content(message: dict) -> bool:
+    return bool(_visible_body_text(message) or message.get("attachments") or _hosted_image_refs(message))
 
 
 def _hosted_image_ref(message: dict, occurrence: int):

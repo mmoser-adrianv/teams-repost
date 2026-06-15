@@ -72,6 +72,33 @@ Open `http://localhost:8000/`, sign in, then repost translated Chinese versions 
 
 The browser sign-in also seeds the backend MSAL token cache used by automation. If the cache expires or is revoked, sign in again through the manager UI.
 
+## Docker on Windows
+
+Docker Desktop can run the app without `systemd`. The Compose setup runs two services from the same image:
+
+- `web` serves the manager UI and API on `http://localhost:8000/`.
+- `automation` runs `python -m automation_worker --once`, sleeps for 5 minutes, and repeats.
+
+Copy `.env.example` to `.env`, fill in the settings, and keep:
+
+```env
+REDIRECT_URI=http://localhost:8000/auth/callback
+```
+
+Start both services with:
+
+```powershell
+docker compose up --build
+```
+
+Both services mount `.data/` into the container, so the MSAL token cache, post cache, repost history, exception lists, and automation lock persist across container restarts. Keep `AUTOMATION_ENABLED=false` until you have signed in through the manager UI and confirmed manual read, translate, and repost behavior. To enable unattended reposting, set `AUTOMATION_ENABLED=true` in `.env` and restart Compose:
+
+```powershell
+docker compose up -d
+```
+
+The `systemd/` units remain for Linux server deployments. Docker uses the `automation` service loop instead of a `systemd` timer.
+
 ## Automation Worker
 
 Run one unattended automation pass with:
