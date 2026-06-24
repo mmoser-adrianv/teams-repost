@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import html
+import json
 import logging
 import uuid
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from graph_client import GraphAPIError, GraphClient
 from message_rebuilder import (
@@ -29,6 +31,10 @@ from teams_url_parser import TeamsMessageLink, parse_teams_message_url
 logger = logging.getLogger(__name__)
 
 _SENSITIVE_GRAPH_RESPONSE_KEYS = ("authorization", "contentbytes", "password", "secret", "token")
+_GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES = 4 * 1024 * 1024
+_GRAPH_MESSAGE_PAYLOAD_SAFETY_BYTES = 64 * 1024
+_GRAPH_MESSAGE_PAYLOAD_TARGET_BYTES = _GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES - _GRAPH_MESSAGE_PAYLOAD_SAFETY_BYTES
+_SUPPORTED_INLINE_HOSTED_CONTENT_TYPES = {"image/jpg", "image/jpeg", "image/png"}
 
 
 class ForwardRequestLike(Protocol):
@@ -48,6 +54,21 @@ class DestinationChannel:
 class PreparedAttachments:
     reference_attachments: list[ReferenceAttachment]
     statuses: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class InlinePayloadOmission:
+    upload: HostedContentUpload
+    reason: str
+
+
+@dataclass(frozen=True)
+class InlinePayloadPlan:
+    payload: dict[str, Any]
+    included_uploads: list[HostedContentUpload]
+    omitted_uploads: list[InlinePayloadOmission]
+    warnings: list[str]
+    diagnostics: list[dict[str, Any]]
 
 
 class RepostFidelityError(ValueError):
@@ -107,30 +128,37 @@ async def repost_parsed_message(
     subject = build_forward_subject(source_message)
     prepared_attachments = _prepare_attachments_for_repost(attachments)
     downloaded_images = await _download_required_hosted_images(parsed_source, hosted_refs, graph, settings)
-    inline_body = replace_hosted_content_refs(original_body_html, downloaded_images)
-    body = _body_with_reference_attachments(
-        build_forward_body(source_message, parsed_source, inline_body, [], warnings),
-        prepared_attachments.reference_attachments,
+    plan = _build_payload_with_inline_budget(
+        subject=subject,
+        source_message=source_message,
+        parsed_source=parsed_source,
+        content_body_html=original_body_html,
+        uploads=downloaded_images,
+        attachments=prepared_attachments.reference_attachments,
+        warnings=warnings,
+        image_replacer=replace_hosted_content_refs,
     )
-    payload = build_channel_message_payload(subject, body, downloaded_images, prepared_attachments.reference_attachments)
     try:
-        new_message = await graph.create_channel_message(destination.team_id, destination.channel_id, payload)
+        new_message = await graph.create_channel_message(destination.team_id, destination.channel_id, plan.payload)
     except GraphAPIError as exc:
-        _log_inline_failure_if_present(exc, downloaded_images)
+        _log_inline_failure_if_present(exc, plan.included_uploads)
         raise
 
-    image_statuses = _recreated_image_statuses(downloaded_images)
+    image_statuses = _recreated_image_statuses(plan.included_uploads) + _omitted_image_statuses(plan.omitted_uploads)
     for status in image_statuses:
-        logger.info("Inline image recreated", extra=status)
+        if status["status"] == "recreated_inline":
+            logger.info("Inline image recreated", extra=status)
+        else:
+            logger.warning("Inline image omitted from repost payload", extra=status)
     return _post_report(
         parsed_source,
         source_message,
         new_message,
         attachment_links,
-        warnings,
+        plan.warnings,
         image_statuses,
         prepared_attachments.statuses,
-        [],
+        plan.diagnostics,
     )
 
 
@@ -165,31 +193,38 @@ async def repost_translated_message(
 
     prepared_attachments = _prepare_attachments_for_repost(attachments)
     downloaded_images = await _download_required_hosted_images(parsed_source, hosted_refs, graph, settings)
-    inline_body = replace_display_image_refs(translated_body_html, downloaded_images)
-    _ensure_translated_body_references_images(inline_body, downloaded_images, display_refs)
-    body = _body_with_reference_attachments(
-        build_forward_body(source_message, parsed_source, inline_body, [], warnings),
-        prepared_attachments.reference_attachments,
+    plan = _build_payload_with_inline_budget(
+        subject=subject,
+        source_message=source_message,
+        parsed_source=parsed_source,
+        content_body_html=translated_body_html,
+        uploads=downloaded_images,
+        attachments=prepared_attachments.reference_attachments,
+        warnings=warnings,
+        image_replacer=replace_display_image_refs,
+        display_refs=display_refs,
     )
-    payload = build_channel_message_payload(subject, body, downloaded_images, prepared_attachments.reference_attachments)
     try:
-        new_message = await graph.create_channel_message(destination.team_id, destination.channel_id, payload)
+        new_message = await graph.create_channel_message(destination.team_id, destination.channel_id, plan.payload)
     except GraphAPIError as exc:
-        _log_inline_failure_if_present(exc, downloaded_images)
+        _log_inline_failure_if_present(exc, plan.included_uploads)
         raise
 
-    image_statuses = _recreated_image_statuses(downloaded_images)
+    image_statuses = _recreated_image_statuses(plan.included_uploads) + _omitted_image_statuses(plan.omitted_uploads)
     for status in image_statuses:
-        logger.info("Inline image recreated", extra=status)
+        if status["status"] == "recreated_inline":
+            logger.info("Inline image recreated", extra=status)
+        else:
+            logger.warning("Inline image omitted from repost payload", extra=status)
     report = _post_report(
         parsed_source,
         source_message,
         new_message,
         attachment_links,
-        warnings,
+        plan.warnings,
         image_statuses,
         prepared_attachments.statuses,
-        [],
+        plan.diagnostics,
     )
     report["translation_target_language"] = target_language
     return report
@@ -334,6 +369,18 @@ def _recreated_image_statuses(uploads: list[HostedContentUpload]) -> list[dict[s
     return [{"occurrence": upload.occurrence, "status": "recreated_inline"} for upload in uploads]
 
 
+def _omitted_image_statuses(omissions: list[InlinePayloadOmission]) -> list[dict[str, Any]]:
+    return [
+        {
+            "occurrence": omission.upload.occurrence,
+            "status": _omitted_inline_status(omission),
+            "content_type": omission.upload.content_type,
+            "byte_size": len(omission.upload.content_bytes),
+        }
+        for omission in omissions
+    ]
+
+
 def _ensure_translated_body_references_images(
     body_html: str,
     uploads: list[HostedContentUpload],
@@ -346,6 +393,158 @@ def _ensure_translated_body_references_images(
             "Cannot repost this translated message at native fidelity because the translated body is missing "
             f"embedded image placeholder(s): {missing}. Detected translated image placeholders: {display_occurrences}."
         )
+
+
+def _build_payload_with_inline_budget(
+    *,
+    subject: str,
+    source_message: dict[str, Any],
+    parsed_source: TeamsMessageLink,
+    content_body_html: str,
+    uploads: list[HostedContentUpload],
+    attachments: list[ReferenceAttachment],
+    warnings: list[str],
+    image_replacer: Callable[[str, list[HostedContentUpload], dict[int, str]], str],
+    display_refs: list[Any] | None = None,
+) -> InlinePayloadPlan:
+    included: list[HostedContentUpload] = []
+    omitted: list[InlinePayloadOmission] = []
+    for upload in uploads:
+        if _can_embed_inline_content_type(upload.content_type):
+            included.append(upload)
+        else:
+            omitted.append(InlinePayloadOmission(upload, "unsupported_content_type"))
+
+    while True:
+        placeholders = _omitted_inline_image_placeholders(omitted, source_message, parsed_source)
+        inline_body = image_replacer(content_body_html, included, placeholders)
+        if display_refs is not None:
+            _ensure_translated_body_references_images(inline_body, included, display_refs)
+
+        plan_warnings = [*warnings, *_omitted_inline_image_warnings(omitted)]
+        body = _body_with_reference_attachments(
+            build_forward_body(source_message, parsed_source, inline_body, [], plan_warnings),
+            attachments,
+        )
+        payload = build_channel_message_payload(subject, body, included, attachments)
+        payload_size = _graph_payload_size(payload)
+        if payload_size <= _GRAPH_MESSAGE_PAYLOAD_TARGET_BYTES:
+            return InlinePayloadPlan(
+                payload=payload,
+                included_uploads=included,
+                omitted_uploads=omitted,
+                warnings=plan_warnings,
+                diagnostics=_omitted_inline_image_diagnostics(omitted, payload_size),
+            )
+
+        if not included:
+            raise InlineImageRepostError(
+                "Cannot repost this message because the Microsoft Graph channel-message payload remains larger than "
+                f"{_format_bytes(_GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES)} after omitting inline images."
+            )
+
+        drop = max(included, key=lambda upload: len(upload.content_bytes))
+        included = [upload for upload in included if upload.occurrence != drop.occurrence]
+        omitted.append(InlinePayloadOmission(drop, "payload_size_limit"))
+
+
+def _can_embed_inline_content_type(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() in _SUPPORTED_INLINE_HOSTED_CONTENT_TYPES
+
+
+def _graph_payload_size(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def _omitted_inline_image_placeholders(
+    omissions: list[InlinePayloadOmission],
+    source_message: dict[str, Any],
+    parsed_source: TeamsMessageLink,
+) -> dict[int, str]:
+    return {
+        omission.upload.occurrence: _omitted_inline_image_placeholder(omission, source_message, parsed_source)
+        for omission in omissions
+    }
+
+
+def _omitted_inline_image_placeholder(
+    omission: InlinePayloadOmission,
+    source_message: dict[str, Any],
+    parsed_source: TeamsMessageLink,
+) -> str:
+    upload = omission.upload
+    source_url = source_message.get("webUrl") or parsed_source.raw_url
+    if omission.reason == "unsupported_content_type":
+        text = (
+            f"Embedded image {upload.occurrence} omitted from this repost because Microsoft Graph does not accept "
+            f"{upload.content_type} as native inline hosted content."
+        )
+    else:
+        text = (
+            f"Embedded image {upload.occurrence} omitted from this repost because it is too large "
+            f"to embed through Microsoft Graph ({_format_bytes(len(upload.content_bytes))})."
+        )
+    if source_url:
+        return (
+            '<span><strong>'
+            + html.escape(text)
+            + '</strong> <a href="'
+            + html.escape(source_url, quote=True)
+            + '">Open original message</a>.</span>'
+        )
+    return "<span><strong>" + html.escape(text) + "</strong></span>"
+
+
+def _omitted_inline_image_warnings(omissions: list[InlinePayloadOmission]) -> list[str]:
+    return [_omitted_inline_image_warning(omission) for omission in omissions]
+
+
+def _omitted_inline_image_warning(omission: InlinePayloadOmission) -> str:
+    upload = omission.upload
+    if omission.reason == "unsupported_content_type":
+        return (
+            f"Inline image {upload.occurrence} was omitted because Microsoft Graph only accepts "
+            "image/jpg, image/jpeg, and image/png as native inline hosted content; "
+            f"the downloaded content type was {upload.content_type}."
+        )
+    return (
+        f"Inline image {upload.occurrence} was omitted because embedding it would exceed the "
+        f"Microsoft Graph {_format_bytes(_GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES)} channel-message payload limit "
+        f"(downloaded size {_format_bytes(len(upload.content_bytes))})."
+    )
+
+
+def _omitted_inline_image_diagnostics(
+    omissions: list[InlinePayloadOmission],
+    final_payload_size: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "status": _omitted_inline_status(omission),
+            "occurrence": omission.upload.occurrence,
+            "content_type": omission.upload.content_type,
+            "byte_size": len(omission.upload.content_bytes),
+            "reason": omission.reason,
+            "payload_limit_bytes": _GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES,
+            "payload_target_bytes": _GRAPH_MESSAGE_PAYLOAD_TARGET_BYTES,
+            "final_payload_size_bytes": final_payload_size,
+        }
+        for omission in omissions
+    ]
+
+
+def _omitted_inline_status(omission: InlinePayloadOmission) -> str:
+    if omission.reason == "unsupported_content_type":
+        return "omitted_inline_unsupported_content_type"
+    return "omitted_inline_too_large"
+
+
+def _format_bytes(value: int) -> str:
+    if value >= 1024 * 1024:
+        return f"{value / (1024 * 1024):.1f} MiB"
+    if value >= 1024:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value} bytes"
 
 
 def _log_inline_failure_if_present(exc: GraphAPIError, uploads: list[HostedContentUpload]) -> None:

@@ -1,12 +1,12 @@
 from functools import lru_cache
 from pathlib import Path
-import tempfile
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 APP_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = Path(".data")
 DEFAULT_GRAPH_SCOPES = ("offline_access", "ChannelMessage.Read.All", "ChannelMessage.Send")
 VALID_AUTOMATION_FLOWS = {"forward", "reverse"}
 
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     graph_base_url: str = Field(default="https://graph.microsoft.com/v1.0", alias="GRAPH_BASE_URL")
     graph_scopes: str = Field(default=" ".join(DEFAULT_GRAPH_SCOPES), alias="GRAPH_SCOPES")
     msal_token_cache_path: Path = Field(
-        default_factory=lambda: Path(tempfile.gettempdir()) / "teams-repost" / "msal-token-cache.json",
+        default_factory=lambda: DEFAULT_DATA_DIR / "msal-token-cache.json",
         alias="MSAL_TOKEN_CACHE_PATH",
     )
     source_team_id: str | None = Field(default=None, alias="SOURCE_TEAM_ID")
@@ -27,22 +27,22 @@ class Settings(BaseSettings):
     destination_team_id: str | None = Field(default=None, alias="DESTINATION_TEAM_ID")
     destination_channel_id: str | None = Field(default=None, alias="DESTINATION_CHANNEL_ID")
     repost_history_path: Path = Field(
-        default_factory=lambda: Path(tempfile.gettempdir()) / "teams-repost" / "repost-history.json",
+        default_factory=lambda: DEFAULT_DATA_DIR / "repost-history.json",
         alias="REPOST_HISTORY_PATH",
     )
     post_cache_path: Path = Field(
-        default_factory=lambda: Path(tempfile.gettempdir()) / "teams-repost" / "post-cache.json",
+        default_factory=lambda: DEFAULT_DATA_DIR / "post-cache.json",
         alias="POST_CACHE_PATH",
     )
     exception_list_path: Path = Field(
-        default_factory=lambda: Path(tempfile.gettempdir()) / "teams-repost" / "exception-list.json",
+        default_factory=lambda: DEFAULT_DATA_DIR / "exception-list.json",
         alias="EXCEPTION_LIST_PATH",
     )
     reverse_exception_list_path: Path | None = Field(default=None, alias="REVERSE_EXCEPTION_LIST_PATH")
     post_list_limit: int = Field(default=25, alias="POST_LIST_LIMIT", ge=1, le=100)
     post_cache_max_refresh_pages: int = Field(default=10, alias="POST_CACHE_MAX_REFRESH_PAGES", ge=1, le=100)
     max_file_size_mb: int = Field(default=25, alias="MAX_FILE_SIZE_MB", ge=1)
-    temp_folder: Path = Field(default_factory=lambda: Path(tempfile.gettempdir()) / "teams-repost", alias="TEMP_FOLDER")
+    temp_folder: Path = Field(default_factory=lambda: DEFAULT_DATA_DIR / "temp", alias="TEMP_FOLDER")
     session_secret: str = Field(default="dev-only-change-me", alias="SESSION_SECRET")
     graph_request_timeout_seconds: float = Field(default=60.0, alias="GRAPH_REQUEST_TIMEOUT_SECONDS")
     graph_max_retries: int = Field(default=3, alias="GRAPH_MAX_RETRIES", ge=0)
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     automation_flows: str = Field(default="forward,reverse", alias="AUTOMATION_FLOWS")
     automation_max_posts_per_flow: int = Field(default=10, alias="AUTOMATION_MAX_POSTS_PER_FLOW", ge=1, le=50)
     automation_lock_path: Path = Field(
-        default_factory=lambda: Path(tempfile.gettempdir()) / "teams-repost" / "automation.lock",
+        default_factory=lambda: DEFAULT_DATA_DIR / "automation.lock",
         alias="AUTOMATION_LOCK_PATH",
     )
 

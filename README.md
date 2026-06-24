@@ -14,7 +14,7 @@ These payloads and endpoints were checked against Microsoft Graph documentation 
 - File attachments: source `reference` attachments are attached to the repost as native Teams `reference` attachment cards using their original `contentUrl`.
 - List source channel messages: `GET /teams/{team-id}/channels/{channel-id}/messages`
 
-Inline images are required when the source message contains them. If Graph cannot download an inline image or rejects the native hosted-content payload, the repost fails instead of publishing a degraded text-link fallback. File attachments are also required to attach natively as Teams attachment cards; unsupported attachment types block the repost instead of becoming text links.
+Inline images are recreated when Microsoft Graph can accept them in the channel-message payload. Oversized inline media, GIFs, and other unsupported inline hosted-content types are omitted with an in-message source link placeholder and a saved warning so automation can continue without retrying the same post forever. File attachments are required to attach natively as Teams attachment cards; unsupported attachment types block the repost instead of becoming text links.
 
 ## Setup
 
@@ -32,7 +32,7 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-`TEMP_FOLDER` can be any writable temporary folder. Relative `TEMP_FOLDER`, `REPOST_HISTORY_PATH`, `POST_CACHE_PATH`, `MSAL_TOKEN_CACHE_PATH`, and `AUTOMATION_LOCK_PATH` values are resolved from the app folder, and the sample config keeps runtime files under `.data/`.
+Runtime files default to `.data/` under the app folder. `TEMP_FOLDER` can be any writable temporary folder, and relative `TEMP_FOLDER`, `REPOST_HISTORY_PATH`, `POST_CACHE_PATH`, `EXCEPTION_LIST_PATH`, `REVERSE_EXCEPTION_LIST_PATH`, `MSAL_TOKEN_CACHE_PATH`, and `AUTOMATION_LOCK_PATH` values are resolved from the app folder.
 
 3. Configure the Entra app registration as a delegated web or public-client flow.
 

@@ -82,10 +82,14 @@ class InlineImageGraph:
         fail_inline_post: bool = False,
         fail_second_download: bool = False,
         include_attachment: bool = False,
+        image_bytes_by_id: dict[str, bytes] | None = None,
+        content_type_by_id: dict[str, str] | None = None,
     ) -> None:
         self.fail_inline_post = fail_inline_post
         self.fail_second_download = fail_second_download
         self.include_attachment = include_attachment
+        self.image_bytes_by_id = image_bytes_by_id or {}
+        self.content_type_by_id = content_type_by_id or {}
         self.created_payloads = []
         self.file_api_calls = []
 
@@ -119,7 +123,10 @@ class InlineImageGraph:
     async def download_message_hosted_content(self, team_id, channel_id, message_id, hosted_content_id, parent_message_id=None):
         if hosted_content_id == "image-2" and self.fail_second_download:
             raise GraphAPIError(404, "not found")
-        return f"bytes-{hosted_content_id}".encode("ascii"), "image/png"
+        return (
+            self.image_bytes_by_id.get(hosted_content_id, f"bytes-{hosted_content_id}".encode("ascii")),
+            self.content_type_by_id.get(hosted_content_id, "image/png"),
+        )
 
     async def create_channel_message(self, team_id, channel_id, payload):
         self.created_payloads.append(payload)
@@ -315,6 +322,56 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Open embedded image", attempted_payload["body"]["content"])
         self.assertNotIn("Open original message for embedded image", attempted_payload["body"]["content"])
 
+    async def test_repost_omits_inline_image_when_payload_would_exceed_graph_limit(self) -> None:
+        settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
+        graph = InlineImageGraph(image_bytes_by_id={"image-1": b"x" * (3 * 1024 * 1024)})
+        parsed = TeamsMessageLink(
+            tenant_id=None,
+            team_id="source-team",
+            source_channel_thread_id="source-channel",
+            message_id="msg-1",
+            parent_message_id=None,
+            raw_url="https://teams.microsoft.com/source",
+        )
+
+        report = await repost_parsed_message(parsed, DestinationChannel("dest-team", "dest-channel"), graph, settings)
+
+        payload = graph.created_payloads[0]
+        body = payload["body"]["content"]
+        self.assertEqual(report["new_message_id"], "new-message-1")
+        self.assertEqual(len(payload["hostedContents"]), 1)
+        self.assertEqual(payload["hostedContents"][0]["@microsoft.graph.temporaryId"], "2")
+        self.assertIn("Embedded image 1 omitted from this repost", body)
+        self.assertIn("Open original message", body)
+        self.assertNotIn("image-1/$value", body)
+        self.assertIn('src="../hostedContents/2/$value"', body)
+        self.assertEqual([item["status"] for item in report["inline_image_statuses"]], ["recreated_inline", "omitted_inline_too_large"])
+        self.assertEqual(report["inline_image_diagnostics"][0]["status"], "omitted_inline_too_large")
+
+    async def test_repost_omits_gif_inline_image_because_graph_does_not_accept_gif_hosted_content(self) -> None:
+        settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
+        graph = InlineImageGraph(content_type_by_id={"image-2": "image/gif"})
+        parsed = TeamsMessageLink(
+            tenant_id=None,
+            team_id="source-team",
+            source_channel_thread_id="source-channel",
+            message_id="msg-1",
+            parent_message_id=None,
+            raw_url="https://teams.microsoft.com/source",
+        )
+
+        report = await repost_parsed_message(parsed, DestinationChannel("dest-team", "dest-channel"), graph, settings)
+
+        payload = graph.created_payloads[0]
+        body = payload["body"]["content"]
+        self.assertEqual(len(payload["hostedContents"]), 1)
+        self.assertEqual(payload["hostedContents"][0]["@microsoft.graph.temporaryId"], "1")
+        self.assertIn('src="../hostedContents/1/$value"', body)
+        self.assertIn("Embedded image 2 omitted from this repost", body)
+        self.assertIn("Microsoft Graph does not accept image/gif", body)
+        self.assertEqual(report["inline_image_statuses"][1]["status"], "omitted_inline_unsupported_content_type")
+        self.assertEqual(report["inline_image_diagnostics"][0]["reason"], "unsupported_content_type")
+
     async def test_translated_repost_uses_translated_body_and_recreates_images(self) -> None:
         settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
         graph = InlineImageGraph(include_attachment=True)
@@ -388,6 +445,42 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hostedContents", graph.created_payloads[0])
         self.assertNotIn("Open embedded image", graph.created_payloads[0]["body"]["content"])
         self.assertNotIn("Open original message for embedded image", graph.created_payloads[0]["body"]["content"])
+
+    async def test_translated_repost_omits_oversized_inline_image_and_posts_degraded_body(self) -> None:
+        settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
+        graph = InlineImageGraph(image_bytes_by_id={"image-1": b"x" * (3 * 1024 * 1024)})
+        parsed = TeamsMessageLink(
+            tenant_id=None,
+            team_id="source-team",
+            source_channel_thread_id="source-channel",
+            message_id="msg-1",
+            parent_message_id=None,
+            raw_url="https://teams.microsoft.com/source",
+        )
+
+        report = await repost_translated_message(
+            parsed,
+            DestinationChannel("dest-team", "dest-channel"),
+            graph,
+            settings,
+            {
+                "subject": "Chinese subject",
+                "body_html": (
+                    '<p><img src="/api/flows/forward/posts/msg-1/images/1">'
+                    '<img src="/api/flows/forward/posts/msg-1/images/2"></p>'
+                ),
+            },
+            "zh-Hans",
+        )
+
+        payload = graph.created_payloads[0]
+        body = payload["body"]["content"]
+        self.assertEqual(report["translation_target_language"], "zh-Hans")
+        self.assertEqual(len(payload["hostedContents"]), 1)
+        self.assertEqual(payload["hostedContents"][0]["@microsoft.graph.temporaryId"], "2")
+        self.assertIn("Embedded image 1 omitted from this repost", body)
+        self.assertIn('src="../hostedContents/2/$value"', body)
+        self.assertEqual(report["inline_image_statuses"][1]["status"], "omitted_inline_too_large")
 
 
 if __name__ == "__main__":

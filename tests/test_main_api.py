@@ -42,6 +42,8 @@ class FakeGraph:
         self.fail_create_with_hosted_contents = False
         self.fail_file_upload = False
         self.fail_get_message_ids = set()
+        self.hosted_content_bytes = b"image-bytes"
+        self.hosted_content_type = "image/png"
         self.messages = {}
         self.file_api_calls = []
         self.pages = [
@@ -86,7 +88,7 @@ class FakeGraph:
         return [{"id": "image-1"}]
 
     async def download_message_hosted_content(self, team_id, channel_id, message_id, hosted_content_id, parent_message_id=None):
-        return b"image-bytes", "image/png"
+        return self.hosted_content_bytes, self.hosted_content_type
 
     async def create_channel_message(self, team_id, channel_id, payload):
         self.create_calls += 1
@@ -962,6 +964,79 @@ class MainApiTests(unittest.TestCase):
         self.assertNotIn("Open embedded image", self.graph.created_payloads[0]["body"]["content"])
         self.assertNotIn("Open original message for embedded image", self.graph.created_payloads[0]["body"]["content"])
         self.assertIsNone(
+            RepostHistory(main.settings.repost_history_path).get(
+                "source-team",
+                "19:source@thread.tacv2",
+                "msg-1",
+                "zh-Hans",
+            )
+        )
+
+    def test_create_repost_omits_oversized_inline_image_and_writes_history(self) -> None:
+        cache = PostCache(main.settings.post_cache_path)
+        cache.upsert_posts("source-team", "19:source@thread.tacv2", [self._cached_post("msg-1", "2026-06-01T01:02:03Z")])
+        cache.upsert_translation(
+            "source-team",
+            "19:source@thread.tacv2",
+            "msg-1",
+            "zh-Hans",
+            {
+                "subject": "Chinese subject",
+                "body_html": '<p><strong>你好</strong> <img src="/api/flows/forward/posts/msg-1/images/1"></p>',
+                "body_preview": "你好",
+            },
+        )
+        self.graph.hosted_content_bytes = b"x" * (3 * 1024 * 1024)
+        self.graph.hosted_content_type = "image/png"
+
+        response = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = self.graph.created_payloads[0]
+        self.assertNotIn("hostedContents", payload)
+        self.assertIn("Embedded image 1 omitted from this repost", payload["body"]["content"])
+        record = response.json()["record"]
+        self.assertEqual(record["status"], "reposted")
+        self.assertEqual(record["inline_image_statuses"][0]["status"], "omitted_inline_too_large")
+        self.assertEqual(record["inline_image_diagnostics"][0]["content_type"], "image/png")
+        self.assertIn("Inline image 1 was omitted", record["warnings"][1])
+        self.assertIsNotNone(
+            RepostHistory(main.settings.repost_history_path).get(
+                "source-team",
+                "19:source@thread.tacv2",
+                "msg-1",
+                "zh-Hans",
+            )
+        )
+
+    def test_create_repost_omits_gif_inline_image_and_writes_history(self) -> None:
+        cache = PostCache(main.settings.post_cache_path)
+        cache.upsert_posts("source-team", "19:source@thread.tacv2", [self._cached_post("msg-1", "2026-06-01T01:02:03Z")])
+        cache.upsert_translation(
+            "source-team",
+            "19:source@thread.tacv2",
+            "msg-1",
+            "zh-Hans",
+            {
+                "subject": "Chinese subject",
+                "body_html": '<p><strong>你好</strong> <img src="/api/flows/forward/posts/msg-1/images/1"></p>',
+                "body_preview": "你好",
+            },
+        )
+        self.graph.hosted_content_bytes = b"small-gif"
+        self.graph.hosted_content_type = "image/gif"
+
+        response = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = self.graph.created_payloads[0]
+        self.assertNotIn("hostedContents", payload)
+        self.assertIn("Microsoft Graph does not accept image/gif", payload["body"]["content"])
+        record = response.json()["record"]
+        self.assertEqual(record["inline_image_statuses"][0]["status"], "omitted_inline_unsupported_content_type")
+        self.assertEqual(record["inline_image_diagnostics"][0]["reason"], "unsupported_content_type")
+        self.assertIn("only accepts image/jpg, image/jpeg, and image/png", record["warnings"][1])
+        self.assertIsNotNone(
             RepostHistory(main.settings.repost_history_path).get(
                 "source-team",
                 "19:source@thread.tacv2",
