@@ -939,6 +939,62 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["id"], attachment["id"])
         self.assertEqual(self.graph.file_api_calls, [])
 
+    def test_create_repost_omits_announcement_banner_attachment_as_regular_post(self) -> None:
+        announcement_attachment = {
+            "id": "announcement-card-1",
+            "name": "attachment-1",
+            "contentType": "application/vnd.microsoft.teams.messaging-announcementBanner",
+        }
+        cached_post = {
+            **self._cached_post("announcement-msg", "2026-06-01T01:02:03Z"),
+            "attachments": [
+                {
+                    "id": announcement_attachment["id"],
+                    "name": announcement_attachment["name"],
+                    "content_type": announcement_attachment["contentType"],
+                    "content_url": None,
+                }
+            ],
+        }
+        cache = PostCache(main.settings.post_cache_path)
+        cache.upsert_posts("source-team", "19:source@thread.tacv2", [cached_post])
+        cache.upsert_translation(
+            "source-team",
+            "19:source@thread.tacv2",
+            "announcement-msg",
+            "zh-Hans",
+            {
+                "subject": "Chinese announcement subject",
+                "body_html": "<p>Chinese announcement body</p>",
+                "body_preview": "Chinese announcement body",
+            },
+        )
+        self.graph.messages["announcement-msg"] = {
+            "subject": "Announcement subject",
+            "body": {"contentType": "html", "content": "<p>Announcement body</p>"},
+            "attachments": [announcement_attachment],
+        }
+
+        response = self.client.post("/api/reposts", json={"source_message_id": "announcement-msg"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = self.graph.created_payloads[0]
+        self.assertNotIn("attachments", payload)
+        self.assertEqual(payload["subject"], "Chinese announcement subject")
+        self.assertIn("<p>Chinese announcement body</p>", payload["body"]["content"])
+        record = response.json()["record"]
+        self.assertEqual(record["destination"]["message_id"], "new-message")
+        self.assertEqual(record["attachment_links"][0]["content_type"], "application/vnd.microsoft.teams.messaging-announcementBanner")
+        self.assertEqual(record["attachment_statuses"][0]["status"], "omitted_announcement_banner")
+        self.assertIsNotNone(
+            RepostHistory(main.settings.repost_history_path).get(
+                "source-team",
+                "19:source@thread.tacv2",
+                "announcement-msg",
+                "zh-Hans",
+            )
+        )
+
     def test_create_repost_aborts_without_history_when_graph_rejects_hosted_content(self) -> None:
         cache = PostCache(main.settings.post_cache_path)
         cache.upsert_posts("source-team", "19:source@thread.tacv2", [self._cached_post("msg-1", "2026-06-01T01:02:03Z")])

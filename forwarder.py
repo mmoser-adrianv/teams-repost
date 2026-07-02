@@ -35,6 +35,7 @@ _GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES = 4 * 1024 * 1024
 _GRAPH_MESSAGE_PAYLOAD_SAFETY_BYTES = 64 * 1024
 _GRAPH_MESSAGE_PAYLOAD_TARGET_BYTES = _GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES - _GRAPH_MESSAGE_PAYLOAD_SAFETY_BYTES
 _SUPPORTED_INLINE_HOSTED_CONTENT_TYPES = {"image/jpg", "image/jpeg", "image/png"}
+_ANNOUNCEMENT_BANNER_CONTENT_TYPE = "application/vnd.microsoft.teams.messaging-announcementbanner"
 
 
 class ForwardRequestLike(Protocol):
@@ -314,36 +315,61 @@ async def _download_required_hosted_images(
 def _prepare_attachments_for_repost(attachments: list[dict]) -> PreparedAttachments:
     if not attachments:
         return PreparedAttachments([], [])
-    reference_attachments = build_reference_attachments(attachments)
-    return PreparedAttachments(reference_attachments, [attachment.to_status() for attachment in reference_attachments])
+    reference_attachments: list[ReferenceAttachment] = []
+    statuses: list[dict[str, Any]] = []
+    for index, attachment in enumerate(attachments, start=1):
+        if _is_announcement_banner_attachment(attachment):
+            statuses.append(_omitted_announcement_banner_status(attachment, index))
+            continue
+        reference_attachment = _build_reference_attachment(attachment, index)
+        reference_attachments.append(reference_attachment)
+        statuses.append(reference_attachment.to_status())
+    return PreparedAttachments(reference_attachments, statuses)
 
 
 def build_reference_attachments(attachments: list[dict]) -> list[ReferenceAttachment]:
-    _validate_reference_attachments(attachments)
     return [
-        ReferenceAttachment(
-            id=str(uuid.uuid4()),
-            name=attachment.get("name") or f"attachment-{index}",
-            content_url=attachment["contentUrl"],
-        )
+        _build_reference_attachment(attachment, index)
         for index, attachment in enumerate(attachments, start=1)
+        if not _is_announcement_banner_attachment(attachment)
     ]
 
 
-def _validate_reference_attachments(attachments: list[dict]) -> None:
-    for index, attachment in enumerate(attachments, start=1):
-        name = attachment.get("name") or f"attachment-{index}"
-        content_type = (attachment.get("contentType") or "").lower()
-        content_url = attachment.get("contentUrl")
-        if content_type != "reference":
-            raise AttachmentRepostError(
-                f"Attachment '{name}' cannot be reposted as a native Teams attachment card "
-                f"because its contentType is '{attachment.get('contentType') or 'missing'}', not 'reference'."
-            )
-        if not content_url:
-            raise AttachmentRepostError(
-                f"Attachment '{name}' cannot be reposted as a native Teams attachment card because it has no contentUrl."
-            )
+def _build_reference_attachment(attachment: dict, index: int) -> ReferenceAttachment:
+    name = _attachment_name(attachment, index)
+    content_type = (attachment.get("contentType") or "").lower()
+    content_url = attachment.get("contentUrl")
+    if content_type != "reference":
+        raise AttachmentRepostError(
+            f"Attachment '{name}' cannot be reposted as a native Teams attachment card "
+            f"because its contentType is '{attachment.get('contentType') or 'missing'}', not 'reference'."
+        )
+    if not content_url:
+        raise AttachmentRepostError(
+            f"Attachment '{name}' cannot be reposted as a native Teams attachment card because it has no contentUrl."
+        )
+    return ReferenceAttachment(
+        id=str(uuid.uuid4()),
+        name=name,
+        content_url=content_url,
+    )
+
+
+def _is_announcement_banner_attachment(attachment: dict) -> bool:
+    return (attachment.get("contentType") or "").split(";", 1)[0].strip().lower() == _ANNOUNCEMENT_BANNER_CONTENT_TYPE
+
+
+def _omitted_announcement_banner_status(attachment: dict, index: int) -> dict[str, Any]:
+    return {
+        "id": attachment.get("id"),
+        "name": _attachment_name(attachment, index),
+        "content_type": attachment.get("contentType"),
+        "status": "omitted_announcement_banner",
+    }
+
+
+def _attachment_name(attachment: dict, index: int) -> str:
+    return attachment.get("name") or f"attachment-{index}"
 
 
 def _body_with_reference_attachments(
@@ -354,15 +380,20 @@ def _body_with_reference_attachments(
 
 
 def _pending_attachment_statuses(attachments: list[dict]) -> list[dict[str, Any]]:
-    _validate_reference_attachments(attachments)
-    return [
-        {
-            "name": attachment.get("name") or f"attachment-{index}",
-            "content_url": attachment.get("contentUrl"),
-            "status": "will_attach_reference",
-        }
-        for index, attachment in enumerate(attachments, start=1)
-    ]
+    statuses: list[dict[str, Any]] = []
+    for index, attachment in enumerate(attachments, start=1):
+        if _is_announcement_banner_attachment(attachment):
+            statuses.append(_omitted_announcement_banner_status(attachment, index))
+            continue
+        _build_reference_attachment(attachment, index)
+        statuses.append(
+            {
+                "name": _attachment_name(attachment, index),
+                "content_url": attachment.get("contentUrl"),
+                "status": "will_attach_reference",
+            }
+        )
+    return statuses
 
 
 def _recreated_image_statuses(uploads: list[HostedContentUpload]) -> list[dict[str, Any]]:
