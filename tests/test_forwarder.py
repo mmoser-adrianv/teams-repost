@@ -467,6 +467,40 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload["hostedContents"]), 2)
         self.assertEqual(payload["attachments"][0]["contentType"], "reference")
 
+    async def test_english_translated_repost_uses_english_metadata_labels(self) -> None:
+        settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
+        graph = InlineImageGraph()
+        parsed = TeamsMessageLink(
+            tenant_id=None,
+            team_id="source-team",
+            source_channel_thread_id="source-channel",
+            message_id="msg-1",
+            parent_message_id=None,
+            raw_url="https://teams.microsoft.com/source",
+        )
+
+        await repost_translated_message(
+            parsed,
+            DestinationChannel("dest-team", "dest-channel"),
+            graph,
+            settings,
+            {
+                "subject": "English subject",
+                "body_html": (
+                    '<p><strong>Hello team</strong></p>'
+                    '<p><img src="/api/flows/reverse/posts/msg-1/images/1">'
+                    '<img src="/api/flows/reverse/posts/msg-1/images/2"></p>'
+                ),
+            },
+            "en",
+        )
+
+        body = graph.created_payloads[0]["body"]["content"]
+        self.assertIn("<strong>Original author:</strong>", body)
+        self.assertIn("<strong>Original link:</strong>", body)
+        self.assertNotIn("原文作者", body)
+        self.assertNotIn("原文連結", body)
+
     async def test_translated_repost_aborts_without_fallback_when_graph_rejects_hosted_content(self) -> None:
         settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
         graph = InlineImageGraph(fail_inline_post=True)

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Translated Reply Sync</title>
+    <link rel="stylesheet" href="/reply-sync/styles.css?v=1">
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Translated Reply Sync</h1>
+        <p>Ordered, isolated synchronization for replies to translated Teams posts.</p>
+      </div>
+      <nav>
+        <a class="button secondary" href="/">Post manager</a>
+        <span id="authStatus" class="status">Checking sign-in</span>
+        <a id="loginLink" class="button secondary" href="/auth/login?return_to=/reply-sync">Sign in</a>
+        <button id="discoverButton" class="button" type="button">Discover mappings</button>
+      </nav>
+    </header>
+    <main>
+      <div id="automationBanner" class="banner hidden"></div>
+      <div id="message" class="banner hidden" role="status"></div>
+      <section class="summary">
+        <span id="threadCount">0 threads</span>
+        <button id="refreshButton" class="button secondary" type="button">Refresh status</button>
+      </section>
+      <section id="threads" class="thread-list" aria-live="polite"></section>
+    </main>
+    <template id="threadTemplate">
+      <article class="thread-card">
+        <div class="thread-heading">
+          <div>
+            <h2 class="thread-title"></h2>
+            <p class="thread-meta"></p>
+          </div>
+          <span class="badge"></span>
+        </div>
+        <dl class="metrics"></dl>
+        <p class="error hidden"></p>
+        <div class="links"></div>
+        <div class="actions"></div>
+      </article>
+    </template>
+    <script src="/reply-sync/app.js?v=1"></script>
+  </body>
+</html>

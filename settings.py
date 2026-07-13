@@ -9,6 +9,7 @@ APP_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path(".data")
 DEFAULT_GRAPH_SCOPES = ("offline_access", "ChannelMessage.Read.All", "ChannelMessage.Send")
 VALID_AUTOMATION_FLOWS = {"forward", "reverse"}
+AUTOMATION_FLOW_ALIASES = {"backward": "reverse"}
 
 
 class Settings(BaseSettings):
@@ -127,6 +128,7 @@ def parse_graph_scopes(value: str) -> list[str]:
 def parse_automation_flows(value: str) -> list[str]:
     flows: list[str] = []
     for flow in [item.strip().lower() for item in value.replace(",", " ").split() if item.strip()]:
+        flow = AUTOMATION_FLOW_ALIASES.get(flow, flow)
         if flow not in VALID_AUTOMATION_FLOWS:
             raise ValueError("AUTOMATION_FLOWS must contain only forward and/or reverse")
         if flow not in flows:

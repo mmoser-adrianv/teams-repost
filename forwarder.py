@@ -204,6 +204,7 @@ async def repost_translated_message(
         warnings=warnings,
         image_replacer=replace_display_image_refs,
         display_refs=display_refs,
+        target_language=target_language,
     )
     try:
         new_message = await graph.create_channel_message(destination.team_id, destination.channel_id, plan.payload)
@@ -437,6 +438,7 @@ def _build_payload_with_inline_budget(
     warnings: list[str],
     image_replacer: Callable[[str, list[HostedContentUpload], dict[int, str]], str],
     display_refs: list[Any] | None = None,
+    target_language: str | None = None,
 ) -> InlinePayloadPlan:
     included: list[HostedContentUpload] = []
     omitted: list[InlinePayloadOmission] = []
@@ -454,7 +456,7 @@ def _build_payload_with_inline_budget(
 
         plan_warnings = [*warnings, *_omitted_inline_image_warnings(omitted)]
         body = _body_with_reference_attachments(
-            build_forward_body(source_message, parsed_source, inline_body, [], plan_warnings),
+            build_forward_body(source_message, parsed_source, inline_body, [], plan_warnings, target_language),
             attachments,
         )
         payload = build_channel_message_payload(subject, body, included, attachments)

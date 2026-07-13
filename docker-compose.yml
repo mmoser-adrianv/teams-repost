@@ -25,3 +25,21 @@ services:
     depends_on:
       - web
     restart: unless-stopped
+
+  reply-sync-automation:
+    profiles:
+      - reply-sync
+    build: .
+    image: teams-repost:local
+    env_file:
+      - .env
+    volumes:
+      - ./.data:/app/.data
+    command: >
+      sh -c "while true; do
+        python -m reply_sync.worker --once;
+        sleep 300;
+      done"
+    depends_on:
+      - web
+    restart: unless-stopped

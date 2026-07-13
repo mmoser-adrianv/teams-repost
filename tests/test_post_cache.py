@@ -110,10 +110,22 @@ class PostCacheTests(unittest.TestCase):
                     "body_html": "<p><strong>原文作者：</strong> Chen</p><hr><p>Repost body</p>",
                     "body_preview": "原文作者： Chen Repost body",
                 },
+                {
+                    "id": "msg-0",
+                    "created_date_time": "2026-06-03T01:00:00Z",
+                    "body_html": "<p><strong>Original author:</strong> Chen</p><hr><p>Repost body</p>",
+                    "body_preview": "Original author: Chen Repost body",
+                },
             ],
         )
 
-        page = self.cache.page_posts("team-1", "channel-1", offset=0, limit=10, excluded_body_prefixes=("原文作者：",))
+        page = self.cache.page_posts(
+            "team-1",
+            "channel-1",
+            offset=0,
+            limit=10,
+            excluded_body_prefixes=("原文作者：", "Original author:"),
+        )
 
         self.assertEqual([post["id"] for post in page["posts"]], ["msg-2"])
         self.assertIsNone(page["next_offset"])
