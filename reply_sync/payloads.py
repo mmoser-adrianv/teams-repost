@@ -17,6 +17,11 @@ from message_rebuilder import (
 GRAPH_PAYLOAD_LIMIT_BYTES = 4 * 1024 * 1024
 GRAPH_PAYLOAD_TARGET_BYTES = GRAPH_PAYLOAD_LIMIT_BYTES - (64 * 1024)
 SUPPORTED_INLINE_TYPES = {"image/jpg", "image/jpeg", "image/png"}
+ENGLISH_REPLY_SOURCE_PREFIX = "Reply source:"
+CHINESE_REPLY_SOURCE_PREFIX = "回覆來源："
+LEGACY_REPLY_AUTHOR_PREFIXES = ("Original reply by:", "原回覆作者：")
+REPLY_SOURCE_MARKER_PREFIX = "reply-source:"
+LEGACY_REPLY_SOURCE_MARKER_PREFIX = "reply-sync-source:"
 
 
 class ReplyFidelityError(ValueError):
@@ -100,7 +105,15 @@ def build_degraded_reply_payload(reply: dict[str, Any], translation: dict[str, A
 def marker_candidates(reply: dict[str, Any]) -> tuple[str, ...]:
     reply_id = str(reply.get("id") or "")
     source_url = str(reply.get("web_url") or "")
-    return tuple(value for value in (source_url, f"reply-sync-source:{reply_id}") if value)
+    return tuple(
+        value
+        for value in (
+            source_url,
+            f"{REPLY_SOURCE_MARKER_PREFIX}{reply_id}" if reply_id else "",
+            f"{LEGACY_REPLY_SOURCE_MARKER_PREFIX}{reply_id}" if reply_id else "",
+        )
+        if value
+    )
 
 
 def _audit_line(reply: dict[str, Any]) -> str:
@@ -109,16 +122,18 @@ def _audit_line(reply: dict[str, Any]) -> str:
     source_url = str(reply.get("web_url") or "")
     reply_id = html.escape(str(reply.get("id") or ""))
     if target_language.lower().startswith("en"):
+        source_label = ENGLISH_REPLY_SOURCE_PREFIX
         author_label = "Original reply by:"
-        link_label = "Source reply"
+        link_label = "Original reply"
     else:
+        source_label = CHINESE_REPLY_SOURCE_PREFIX
         author_label = "原回覆作者："
         link_label = "原回覆"
-    link = _source_link(source_url, link_label) if source_url else f"{link_label} ({reply_id})"
-    marker = f"reply-sync-source:{reply_id}"
+    marker = f"{REPLY_SOURCE_MARKER_PREFIX}{reply_id}"
+    link = _source_link(source_url, link_label) if source_url else f"{link_label} ({marker})"
     return (
-        f"<p><strong>{author_label}</strong> {author}<br>"
-        f"<strong>{html.escape(marker)}</strong> · {link}</p>"
+        f"<p><strong>{source_label}</strong> {link}<br>"
+        f"<strong>{author_label}</strong> {author}</p>"
     )
 
 

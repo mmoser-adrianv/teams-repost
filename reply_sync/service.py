@@ -14,7 +14,17 @@ from translation_service import TranslationError, translate_cached_post
 
 from .config import ReplySyncSettings
 from .graph import ReplyGraph
-from .payloads import ReplyFidelityError, build_degraded_reply_payload, build_reply_payload, marker_candidates
+from .payloads import (
+    CHINESE_REPLY_SOURCE_PREFIX,
+    ENGLISH_REPLY_SOURCE_PREFIX,
+    LEGACY_REPLY_AUTHOR_PREFIXES,
+    LEGACY_REPLY_SOURCE_MARKER_PREFIX,
+    REPLY_SOURCE_MARKER_PREFIX,
+    ReplyFidelityError,
+    build_degraded_reply_payload,
+    build_reply_payload,
+    marker_candidates,
+)
 from .stores import ReplyCache, ReplyHistory, ThreadRegistry, utc_now
 
 
@@ -166,7 +176,11 @@ class ReplySyncService:
         try:
             listed = await graph.list_replies(source["team_id"], source["channel_id"], source["message_id"])
             normalized = sorted(
-                (_normalize_reply(reply, thread["target_language"]) for reply in listed if _is_user_reply(reply)),
+                (
+                    _normalize_reply(reply, thread["target_language"])
+                    for reply in listed
+                    if _is_user_reply(reply) and not _is_translated_reply(reply)
+                ),
                 key=_reply_sort_key,
             )
             thread_cache = self.cache.record_scan(thread_key, normalized)
@@ -434,6 +448,19 @@ def _normalize_reply(message: dict[str, Any], target_language: str) -> dict[str,
 
 def _is_user_reply(message: dict[str, Any]) -> bool:
     return bool(message.get("id")) and str(message.get("messageType") or "message") == "message"
+
+
+def _is_translated_reply(message: dict[str, Any]) -> bool:
+    body_text = _visible_text(normalize_body_to_html(message))
+    translated_prefixes = (
+        ENGLISH_REPLY_SOURCE_PREFIX,
+        CHINESE_REPLY_SOURCE_PREFIX,
+        *LEGACY_REPLY_AUTHOR_PREFIXES,
+    )
+    return body_text.startswith(translated_prefixes) or any(
+        marker in body_text
+        for marker in (REPLY_SOURCE_MARKER_PREFIX, LEGACY_REPLY_SOURCE_MARKER_PREFIX)
+    )
 
 
 def _reply_sort_key(reply: dict[str, Any]) -> tuple[str, tuple[int, str]]:

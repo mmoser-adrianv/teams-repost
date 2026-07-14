@@ -154,9 +154,11 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status"], "completed")
         self.assertEqual(second["sent"], 3)
         bodies = [payload["body"]["content"] for payload in graph.created]
-        self.assertIn("reply-sync-source:1", bodies[0])
-        self.assertIn("reply-sync-source:2", bodies[1])
-        self.assertIn("reply-sync-source:3", bodies[2])
+        self.assertIn("<strong>回覆來源：</strong>", bodies[0])
+        self.assertIn("https://teams.example/source/1", bodies[0])
+        self.assertIn("https://teams.example/source/2", bodies[1])
+        self.assertIn("https://teams.example/source/3", bodies[2])
+        self.assertNotIn("reply-sync", "".join(bodies))
         self.assertEqual(self.translation_calls, ["1", "2", "3"])
 
     async def test_identical_timestamps_use_numeric_message_id_order(self) -> None:
@@ -166,9 +168,9 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.run_thread(self.thread_key, graph)
         await self.service.run_thread(self.thread_key, graph)
         bodies = [payload["body"]["content"] for payload in graph.created]
-        self.assertIn("reply-sync-source:1", bodies[0])
-        self.assertIn("reply-sync-source:2", bodies[1])
-        self.assertIn("reply-sync-source:10", bodies[2])
+        self.assertIn("https://teams.example/source/1", bodies[0])
+        self.assertIn("https://teams.example/source/2", bodies[1])
+        self.assertIn("https://teams.example/source/10", bodies[2])
 
     async def test_stable_prefix_progresses_while_new_reply_is_still_stabilizing(self) -> None:
         graph = FakeReplyGraph([source_reply("1", "2026-07-13T00:00:01Z")])
@@ -182,8 +184,8 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status"], "stabilizing")
         self.assertEqual(second["sent"], 1)
         self.assertEqual(third["sent"], 1)
-        self.assertIn("reply-sync-source:1", graph.created[0]["body"]["content"])
-        self.assertIn("reply-sync-source:2", graph.created[1]["body"]["content"])
+        self.assertIn("https://teams.example/source/1", graph.created[0]["body"]["content"])
+        self.assertIn("https://teams.example/source/2", graph.created[1]["body"]["content"])
 
     async def test_unsupported_first_reply_blocks_later_reply(self) -> None:
         graph = FakeReplyGraph(
@@ -209,8 +211,8 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         continued = await self.service.run_thread(self.thread_key, graph)
         self.assertEqual(degraded["status"], "degraded")
         self.assertEqual(continued["sent"], 1)
-        self.assertIn("reply-sync-source:1", graph.created[0]["body"]["content"])
-        self.assertIn("reply-sync-source:2", graph.created[1]["body"]["content"])
+        self.assertIn("https://teams.example/source/1", graph.created[0]["body"]["content"])
+        self.assertIn("https://teams.example/source/2", graph.created[1]["body"]["content"])
 
     async def test_graph_create_failure_keeps_head_of_line_blocked(self) -> None:
         graph = FakeReplyGraph([source_reply("1", "2026-07-13T00:00:01Z"), source_reply("2", "2026-07-13T00:00:02Z")])
@@ -238,6 +240,36 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(graph.created, [])
         self.assertEqual(self.service.history.get(self.thread_key, "1")["destination_reply_id"], "already-there")
 
+    async def test_generated_reply_headers_are_skipped_in_both_languages(self) -> None:
+        graph = FakeReplyGraph(
+            [
+                source_reply(
+                    "1",
+                    "2026-07-13T00:00:01Z",
+                    body="<p><strong>Reply source:</strong> Original reply</p>",
+                ),
+                source_reply(
+                    "2",
+                    "2026-07-13T00:00:02Z",
+                    body="<p><strong>回覆來源：</strong> 原回覆</p>",
+                ),
+                source_reply(
+                    "3",
+                    "2026-07-13T00:00:03Z",
+                    body="<p><strong>Original reply by:</strong> Legacy author<br>reply-sync-source:old</p>",
+                ),
+                source_reply("4", "2026-07-13T00:00:04Z"),
+            ]
+        )
+        self.service.activate(self.thread_key, "backfill_all")
+
+        await self.service.run_thread(self.thread_key, graph)
+        result = await self.service.run_thread(self.thread_key, graph)
+
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(self.translation_calls, ["4"])
+        self.assertIn("https://teams.example/source/4", graph.created[0]["body"]["content"])
+
     async def test_late_earlier_reply_pauses_with_sequence_conflict(self) -> None:
         graph = FakeReplyGraph([source_reply("2", "2026-07-13T00:00:02Z")])
         self.service.activate(self.thread_key, "backfill_all")
@@ -264,7 +296,7 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         second = await self.service.run_thread(self.thread_key, graph)
         self.assertEqual(first["status"], "stabilizing")
         self.assertEqual(second["sent"], 1)
-        self.assertIn("reply-sync-source:2", graph.created[0]["body"]["content"])
+        self.assertIn("https://teams.example/source/2", graph.created[0]["body"]["content"])
 
     async def test_synced_edit_is_reported_as_drift_without_new_reply(self) -> None:
         graph = FakeReplyGraph([source_reply("1", "2026-07-13T00:00:01Z", etag="v1")])
@@ -304,6 +336,22 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PayloadTests(unittest.TestCase):
+    def test_english_reply_uses_reply_source_label_without_sync_language(self) -> None:
+        reply = {
+            "id": "1",
+            "author": "Alex",
+            "web_url": "https://teams.example/source/1",
+            "target_language": "en",
+            "body_html": "<p>Hello</p>",
+            "attachments": [],
+        }
+
+        payload, _ = build_reply_payload(reply, {"body_html": "<p>Hello</p>"}, {})
+
+        self.assertIn("<strong>Reply source:</strong>", payload["body"]["content"])
+        self.assertIn("<strong>Original reply by:</strong> Alex", payload["body"]["content"])
+        self.assertNotIn("reply-sync", payload["body"]["content"])
+
     def test_builds_reply_with_hosted_image_and_reference_attachment(self) -> None:
         reply = {
             "id": "1",
@@ -320,7 +368,9 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(len(payload["hostedContents"]), 1)
         self.assertEqual(len(payload["attachments"]), 1)
         self.assertIn('../hostedContents/1/$value', payload["body"]["content"])
-        self.assertIn("reply-sync-source:1", payload["body"]["content"])
+        self.assertIn("<strong>回覆來源：</strong>", payload["body"]["content"])
+        self.assertIn("https://teams.example/source/1", payload["body"]["content"])
+        self.assertNotIn("reply-sync", payload["body"]["content"])
         self.assertFalse(fidelity["degraded"])
 
     def test_unsupported_inline_type_blocks_full_fidelity(self) -> None:
