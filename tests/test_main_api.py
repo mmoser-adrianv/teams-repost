@@ -175,6 +175,7 @@ class MainApiTests(unittest.TestCase):
         self.original_graph = main._graph
         self.original_history_path = main.settings.repost_history_path
         self.original_post_cache_path = main.settings.post_cache_path
+        self.original_msal_token_cache_path = main.settings.msal_token_cache_path
         self.original_exception_list_path = main.settings.exception_list_path
         self.original_reverse_exception_list_path = main.settings.reverse_exception_list_path
         self.original_graph_base_url = main.settings.graph_base_url
@@ -197,6 +198,7 @@ class MainApiTests(unittest.TestCase):
         main.settings.destination_channel_id = "19:dest@thread.tacv2"
         main.settings.repost_history_path = Path(self.temp_dir.name) / "history.json"
         main.settings.post_cache_path = Path(self.temp_dir.name) / "post-cache.json"
+        main.settings.msal_token_cache_path = Path(self.temp_dir.name) / "msal-token-cache.json"
         main.settings.exception_list_path = Path(self.temp_dir.name) / "exception-list.json"
         main.settings.reverse_exception_list_path = Path(self.temp_dir.name) / "exception-list-reverse.json"
         main.settings.graph_base_url = "https://graph.microsoft.com/v1.0"
@@ -214,6 +216,7 @@ class MainApiTests(unittest.TestCase):
         main._graph = self.original_graph
         main.settings.repost_history_path = self.original_history_path
         main.settings.post_cache_path = self.original_post_cache_path
+        main.settings.msal_token_cache_path = self.original_msal_token_cache_path
         main.settings.exception_list_path = self.original_exception_list_path
         main.settings.reverse_exception_list_path = self.original_reverse_exception_list_path
         main.settings.graph_base_url = self.original_graph_base_url
@@ -352,7 +355,7 @@ class MainApiTests(unittest.TestCase):
         self.graph.messages["reverse-repost-msg"] = {
             "body": {
                 "contentType": "html",
-                "content": "<p><strong>原文作者：</strong> Chen<br><strong>原文連結：</strong> Source</p><hr><p>English</p>",
+                "content": "<p><strong>Original author:</strong> Chen<br><strong>Original link:</strong> Source</p><hr><p>English</p>",
             }
         }
 
@@ -365,6 +368,28 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(payload["cache"]["posts_skipped_by_body_prefix"], 1)
         cache = PostCache(main.settings.post_cache_path)
         self.assertEqual(cache.list_posts("source-team", "19:source@thread.tacv2"), [])
+
+    def test_forward_refresh_still_skips_legacy_chinese_reverse_repost_body_header(self) -> None:
+        self.graph.pages = [
+            {
+                "messages": [{"id": "legacy-reverse-repost-msg", "subject": "English repost"}],
+                "next_link": None,
+            }
+        ]
+        self.graph.messages["legacy-reverse-repost-msg"] = {
+            "body": {
+                "contentType": "html",
+                "content": "<p><strong>原文作者：</strong> Chen<br><strong>原文連結：</strong> Source</p><hr><p>English</p>",
+            }
+        }
+
+        response = self.client.get("/api/flows/forward/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["posts"], [])
+        self.assertEqual(payload["cache"]["new_posts_saved"], 0)
+        self.assertEqual(payload["cache"]["posts_skipped_by_body_prefix"], 1)
 
     def test_reverse_posts_api_reads_destination_channel_as_source(self) -> None:
         response = self.client.get("/api/flows/reverse/posts?limit=5")
@@ -728,8 +753,8 @@ class MainApiTests(unittest.TestCase):
                     **self._cached_post("reverse-repost", "2026-06-05T09:09:25Z"),
                     "subject": None,
                     "author": None,
-                    "body_html": "<p><strong>原文作者：</strong> Chen<br><strong>原文連結：</strong> Source</p><hr><p>English repost</p>",
-                    "body_preview": "原文作者： Chen 原文連結： Source English repost",
+                    "body_html": "<p><strong>Original author:</strong> Chen<br><strong>Original link:</strong> Source</p><hr><p>English repost</p>",
+                    "body_preview": "Original author: Chen Original link: Source English repost",
                 },
                 self._cached_post("real-msg", "2026-06-04T01:02:03Z"),
             ],

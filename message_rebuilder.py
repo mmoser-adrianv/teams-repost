@@ -15,6 +15,8 @@ DISPLAY_IMAGE_SRC_RE = re.compile(
     r"(?:^|/)(?:api/posts|api/flows/[^/]+/posts)/[^/?#]+/images/(\d+)(?:$|[?#])",
     re.IGNORECASE,
 )
+_CHINESE_REPOST_LABELS = ("原文作者：", "原文連結：")
+_ENGLISH_REPOST_LABELS = ("Original author:", "Original link:")
 
 
 @dataclass(frozen=True)
@@ -168,24 +170,28 @@ def build_forward_body(
     original_body_html: str,
     copied_file_links: list[dict],
     warnings: list[str],
+    target_language: str | None = None,
 ) -> str:
     author = extract_author_display_name(original_message) or "Unknown"
     original_link = original_message.get("webUrl") or parsed_source.raw_url
     original_link_text = _original_link_text(original_message)
+    author_label, original_link_label = _repost_labels_for_target_language(target_language)
 
     parts = [
-        "<p><strong>原文作者：</strong> " + html.escape(author) + "<br>",
+        "<p><strong>" + author_label + "</strong> " + html.escape(author) + "<br>",
     ]
     if original_link:
         parts.append(
-            '<strong>原文連結：</strong> <a href="'
+            "<strong>"
+            + original_link_label
+            + '</strong> <a href="'
             + html.escape(original_link, quote=True)
             + '">'
             + html.escape(original_link_text)
             + "</a></p>"
         )
     else:
-        parts.append("<strong>原文連結：</strong> " + html.escape(original_link_text) + "</p>")
+        parts.append("<strong>" + original_link_label + "</strong> " + html.escape(original_link_text) + "</p>")
 
     if original_message.get("mentions"):
         warning = "Mentions are rendered as plain text and are not recreated as Teams mentions."
@@ -208,6 +214,10 @@ def build_forward_body(
         parts.append("</ul>")
 
     return "".join(parts)
+
+
+def _repost_labels_for_target_language(target_language: str | None) -> tuple[str, str]:
+    return _ENGLISH_REPOST_LABELS if (target_language or "").lower().startswith("en") else _CHINESE_REPOST_LABELS
 
 
 def build_channel_message_payload(

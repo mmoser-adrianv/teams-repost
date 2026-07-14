@@ -45,6 +45,31 @@ class MessageRebuilderTests(unittest.TestCase):
         self.assertNotIn("Inline hosted images", body)
         self.assertIn("<hr><p>Translated body</p>", body)
 
+    def test_builds_english_repost_header_for_english_target(self) -> None:
+        body = build_forward_body(
+            {
+                "subject": "Moira shared this",
+                "webUrl": "https://teams/source",
+                "from": {"user": {"displayName": "LaceyLi - M Moser Associates"}},
+            },
+            TeamsMessageLink(
+                tenant_id=None,
+                team_id="team-1",
+                source_channel_thread_id="channel-1",
+                message_id="msg-1",
+                parent_message_id=None,
+            ),
+            "<p>English body</p>",
+            [],
+            [],
+            target_language="en",
+        )
+
+        self.assertIn("<strong>Original author:</strong> LaceyLi - M Moser Associates", body)
+        self.assertIn('<strong>Original link:</strong> <a href="https://teams/source">Moira shared this</a>', body)
+        self.assertNotIn("原文作者", body)
+        self.assertNotIn("原文連結", body)
+
     def test_finds_hosted_content_refs_in_order(self) -> None:
         refs = find_hosted_content_refs(
             '<p>one<img src="https://graph.microsoft.com/v1.0/teams/t/channels/c/messages/m/hostedContents/id-1/$value">'

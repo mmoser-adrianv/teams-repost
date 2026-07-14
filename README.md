@@ -61,6 +61,20 @@ Both manager pages automatically skip posts whose body text starts with `原文�
 
 `AUTOMATION_ENABLED=false` keeps the unattended worker paused. Set it to `true` only after signing in once and confirming the manager UI can read, translate, and repost. `AUTOMATION_FLOWS=forward,reverse` runs both directions, and `AUTOMATION_MAX_POSTS_PER_FLOW` caps how many cached posts each worker pass checks per flow.
 
+## Translated reply synchronization
+
+The isolated reply manager is available at `/reply-sync`. It reads successful top-level mappings from `REPOST_HISTORY_PATH`, but stores its registry, reply cache, reply history, temporary files, and automation lock separately under `.data/reply-sync/`. Existing post cache and repost history files are never rewritten by the reply module.
+
+Reply automation is disabled by default. Discovery creates preview entries only; each translated thread must be activated as either `backfill_all` or `future_only`. The worker fetches every Microsoft Graph reply page, sorts replies oldest-first, requires two identical complete scans, and blocks later replies in a thread when an earlier reply fails. Supported JPEG/PNG inline images and `reference` attachments are recreated; unsupported content requires an explicit degraded send from the reply manager.
+
+Run one pass only after testing the manager and setting `REPLY_SYNC_ENABLED=true`:
+
+```text
+python -m reply_sync.worker --once
+```
+
+The optional `reply-sync-automation` Compose service is behind the `reply-sync` profile, and the separate `teams-repost-reply-sync.timer` systemd template schedules the same one-shot worker every five minutes.
+
 4. Run the app.
 
 ```powershell

@@ -40,6 +40,7 @@ from message_rebuilder import (
 )
 from post_cache import PostCache, is_presentable_post
 from repost_history import RepostHistory, build_manual_repost_record, build_repost_record
+from reply_sync.router import create_reply_sync_router
 from settings import get_settings
 from teams_url_parser import TeamsMessageLink
 from teams_url_parser import TeamsUrlParseError
@@ -50,10 +51,14 @@ settings = get_settings()
 configure_logging()
 
 STATIC_DIR = Path(__file__).parent / "static"
+CHINESE_REPOST_BODY_PREFIX = "原文作者："
+ENGLISH_REPOST_BODY_PREFIX = "Original author:"
+REPOST_BODY_PREFIXES = (CHINESE_REPOST_BODY_PREFIX, ENGLISH_REPOST_BODY_PREFIX)
 
 app = FastAPI(title="Teams Repost Graph POC", version="0.1.0")
 app.add_middleware(SessionMiddleware, secret_key=settings.session_secret, same_site="lax", https_only=False)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(create_reply_sync_router(settings))
 
 
 class ForwardMessageRequest(BaseModel):
@@ -407,7 +412,7 @@ async def _translate_post(post: dict, target_language: str, settings) -> dict:
 
 
 def _safe_auth_return_path(value: str | None) -> str:
-    return value if value in {"/", "/reverse"} else "/"
+    return value if value in {"/", "/reverse", "/reply-sync"} else "/"
 
 
 def _repost_flow(flow_name: str) -> RepostFlow:
@@ -419,7 +424,7 @@ def _repost_flow(flow_name: str) -> RepostFlow:
             target_language=settings.openai_translation_target,
             translation_target_label="Chinese",
             exception_list_path=settings.exception_list_path,
-            skipped_body_prefixes=("原文作者：",),
+            skipped_body_prefixes=REPOST_BODY_PREFIXES,
         )
     if flow_name == "reverse":
         return RepostFlow(
@@ -429,7 +434,7 @@ def _repost_flow(flow_name: str) -> RepostFlow:
             target_language="en",
             translation_target_label="English",
             exception_list_path=_reverse_exception_list_path(),
-            skipped_body_prefixes=("原文作者：",),
+            skipped_body_prefixes=REPOST_BODY_PREFIXES,
         )
     raise HTTPException(status_code=404, detail=f"Unknown repost flow: {flow_name}")
 

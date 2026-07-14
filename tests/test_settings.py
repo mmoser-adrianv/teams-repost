@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from settings import APP_ROOT, Settings, _app_relative_path
+from settings import APP_ROOT, Settings, _app_relative_path, parse_automation_flows
 
 
 class SettingsTests(unittest.TestCase):
@@ -15,6 +15,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.exception_list_path, Path(".data") / "exception-list.json")
         self.assertEqual(settings.automation_lock_path, Path(".data") / "automation.lock")
         self.assertEqual(_app_relative_path(settings.exception_list_path), APP_ROOT / ".data" / "exception-list.json")
+
+    def test_automation_flows_accepts_backward_as_reverse_alias(self) -> None:
+        self.assertEqual(parse_automation_flows("forward backward"), ["forward", "reverse"])
 
 
 if __name__ == "__main__":

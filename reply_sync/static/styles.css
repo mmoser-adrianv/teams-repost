@@ -1,0 +1,36 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #f4f6f8;
+  color: #17202a;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+header { display: flex; justify-content: space-between; gap: 2rem; padding: 1.5rem 2rem; background: #172b4d; color: white; }
+header h1 { margin: 0 0 .35rem; }
+header p { margin: 0; color: #d9e2f1; }
+nav, .actions, .links, .summary { display: flex; align-items: center; flex-wrap: wrap; gap: .65rem; }
+main { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
+.button { border: 0; border-radius: 6px; padding: .6rem .9rem; cursor: pointer; background: #0052cc; color: white; text-decoration: none; font: inherit; }
+.button.secondary { background: #e9eef5; color: #172b4d; }
+.button.warning { background: #b54708; }
+.button:disabled { opacity: .5; cursor: not-allowed; }
+.status { font-size: .9rem; }
+.banner { padding: .85rem 1rem; margin-bottom: 1rem; border-radius: 6px; background: #fff1cc; border: 1px solid #e5b800; }
+.banner.error { background: #fde7e7; border-color: #c93737; }
+.hidden { display: none !important; }
+.summary { justify-content: space-between; margin-bottom: 1rem; }
+.thread-list { display: grid; gap: 1rem; }
+.thread-card { background: white; border: 1px solid #dfe3e8; border-radius: 10px; padding: 1rem 1.15rem; box-shadow: 0 2px 8px rgba(23, 32, 42, .06); }
+.thread-heading { display: flex; justify-content: space-between; gap: 1rem; }
+.thread-title { margin: 0 0 .25rem; font-size: 1.1rem; overflow-wrap: anywhere; }
+.thread-meta { margin: 0; color: #5e6c84; }
+.badge { height: fit-content; border-radius: 999px; padding: .3rem .65rem; background: #e9eef5; font-size: .8rem; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: .6rem; margin: 1rem 0; }
+.metrics div { background: #f7f8fa; border-radius: 6px; padding: .55rem; }
+.metrics dt { color: #5e6c84; font-size: .75rem; }
+.metrics dd { margin: .2rem 0 0; font-weight: 600; }
+.error { color: #9c1c1c; background: #fff0f0; padding: .65rem; border-radius: 6px; overflow-wrap: anywhere; }
+.links { margin-bottom: .8rem; }
+.links a { color: #0052cc; }
+@media (max-width: 760px) { header { flex-direction: column; } }
