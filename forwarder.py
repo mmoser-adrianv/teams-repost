@@ -36,6 +36,10 @@ _GRAPH_MESSAGE_PAYLOAD_SAFETY_BYTES = 64 * 1024
 _GRAPH_MESSAGE_PAYLOAD_TARGET_BYTES = _GRAPH_MESSAGE_PAYLOAD_LIMIT_BYTES - _GRAPH_MESSAGE_PAYLOAD_SAFETY_BYTES
 _SUPPORTED_INLINE_HOSTED_CONTENT_TYPES = {"image/jpg", "image/jpeg", "image/png"}
 _ANNOUNCEMENT_BANNER_CONTENT_TYPE = "application/vnd.microsoft.teams.messaging-announcementbanner"
+_OMITTABLE_TEAMS_CARD_CONTENT_TYPES = {
+    "application/vnd.microsoft.teams.card.o365connector",
+    "tabreference",
+}
 
 
 class ForwardRequestLike(Protocol):
@@ -113,6 +117,7 @@ async def repost_parsed_message(
     attachments = source_message.get("attachments") or []
     attachment_links = attachment_metadata(attachments)
     attachment_statuses = _pending_attachment_statuses(attachments)
+    warnings.extend(_attachment_warnings(attachments))
 
     if mode == "dry_run":
         return _dry_run_report(
@@ -187,6 +192,7 @@ async def repost_translated_message(
     attachments = source_message.get("attachments") or []
     attachment_links = attachment_metadata(attachments)
     attachment_statuses = _pending_attachment_statuses(attachments)
+    warnings.extend(_attachment_warnings(attachments))
 
     subject = _translated_forward_subject(translation, source_message)
     translated_body_html = translation.get("body_html") or ""
@@ -322,6 +328,9 @@ def _prepare_attachments_for_repost(attachments: list[dict]) -> PreparedAttachme
         if _is_announcement_banner_attachment(attachment):
             statuses.append(_omitted_announcement_banner_status(attachment, index))
             continue
+        if _is_omittable_teams_card_attachment(attachment):
+            statuses.append(_omitted_teams_card_status(attachment, index))
+            continue
         reference_attachment = _build_reference_attachment(attachment, index)
         reference_attachments.append(reference_attachment)
         statuses.append(reference_attachment.to_status())
@@ -332,7 +341,7 @@ def build_reference_attachments(attachments: list[dict]) -> list[ReferenceAttach
     return [
         _build_reference_attachment(attachment, index)
         for index, attachment in enumerate(attachments, start=1)
-        if not _is_announcement_banner_attachment(attachment)
+        if not _is_announcement_banner_attachment(attachment) and not _is_omittable_teams_card_attachment(attachment)
     ]
 
 
@@ -357,7 +366,15 @@ def _build_reference_attachment(attachment: dict, index: int) -> ReferenceAttach
 
 
 def _is_announcement_banner_attachment(attachment: dict) -> bool:
-    return (attachment.get("contentType") or "").split(";", 1)[0].strip().lower() == _ANNOUNCEMENT_BANNER_CONTENT_TYPE
+    return _normalized_attachment_content_type(attachment) == _ANNOUNCEMENT_BANNER_CONTENT_TYPE
+
+
+def _is_omittable_teams_card_attachment(attachment: dict) -> bool:
+    return _normalized_attachment_content_type(attachment) in _OMITTABLE_TEAMS_CARD_CONTENT_TYPES
+
+
+def _normalized_attachment_content_type(attachment: dict) -> str:
+    return (attachment.get("contentType") or "").split(";", 1)[0].strip().lower()
 
 
 def _omitted_announcement_banner_status(attachment: dict, index: int) -> dict[str, Any]:
@@ -366,6 +383,15 @@ def _omitted_announcement_banner_status(attachment: dict, index: int) -> dict[st
         "name": _attachment_name(attachment, index),
         "content_type": attachment.get("contentType"),
         "status": "omitted_announcement_banner",
+    }
+
+
+def _omitted_teams_card_status(attachment: dict, index: int) -> dict[str, Any]:
+    return {
+        "id": attachment.get("id"),
+        "name": _attachment_name(attachment, index),
+        "content_type": attachment.get("contentType"),
+        "status": "omitted_nonportable_teams_card",
     }
 
 
@@ -385,6 +411,9 @@ def _pending_attachment_statuses(attachments: list[dict]) -> list[dict[str, Any]
     for index, attachment in enumerate(attachments, start=1):
         if _is_announcement_banner_attachment(attachment):
             statuses.append(_omitted_announcement_banner_status(attachment, index))
+            continue
+        if _is_omittable_teams_card_attachment(attachment):
+            statuses.append(_omitted_teams_card_status(attachment, index))
             continue
         _build_reference_attachment(attachment, index)
         statuses.append(
@@ -705,4 +734,12 @@ def attachment_metadata(attachments: list[dict]) -> list[dict[str, Any]]:
 
 
 def _attachment_warnings(attachments: list[dict[str, Any]]) -> list[str]:
-    return []
+    return [
+        (
+            f"Attachment '{_attachment_name(attachment, index)}' was omitted because its Teams card type "
+            f"'{attachment.get('contentType') or 'missing'}' cannot be reliably copied to another channel. "
+            "The repost includes a link to the original message."
+        )
+        for index, attachment in enumerate(attachments, start=1)
+        if _is_omittable_teams_card_attachment(attachment)
+    ]

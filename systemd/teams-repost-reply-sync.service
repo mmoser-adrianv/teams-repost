@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/teams-repost
-EnvironmentFile=/opt/teams-repost/.env
-ExecStart=/opt/teams-repost/.venv/bin/python -m reply_sync.worker --once
+WorkingDirectory=/var/www/teams-repost
+EnvironmentFile=/var/www/teams-repost/.env
+ExecStart=/var/www/teams-repost/.venv/bin/python -m reply_sync.worker --once
 User=teams-repost
 Group=teams-repost

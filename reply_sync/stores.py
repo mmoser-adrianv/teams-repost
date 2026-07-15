@@ -57,7 +57,11 @@ class ThreadRegistry:
         data = self._load()
         return sorted(
             (deepcopy(thread) for thread in data["threads"].values()),
-            key=lambda item: (item.get("flow") or "", item.get("source", {}).get("created_date_time") or ""),
+            key=lambda item: (
+                1 if item.get("direction", "primary") == "primary" else 0,
+                item.get("flow") or "",
+                item.get("source", {}).get("created_date_time") or "",
+            ),
             reverse=True,
         )
 
@@ -78,6 +82,7 @@ class ThreadRegistry:
             target_language = str(translation.get("target_language") or "")
             if not target_language:
                 continue
+            reply_sync = record.get("reply_sync") or {}
             flow = "reverse" if target_language.lower().startswith("en") else "forward"
             if flow not in flows:
                 continue
@@ -88,21 +93,32 @@ class ThreadRegistry:
                 continue
             thread_key = str(record.get("source_key") or _thread_key(source, target_language))
             destination_message_id = destination.get("message_id")
+            mapping_key = str(reply_sync.get("mapping_key") or thread_key)
+            direction = str(reply_sync.get("direction") or "primary")
+            counterpart_thread_key = reply_sync.get("counterpart_thread_key")
+            source_language = str(reply_sync.get("source_language") or translation.get("source_language") or "")
+            record_auto_enroll = bool(reply_sync.get("auto_enroll", auto_enroll))
+            promote_existing = bool(reply_sync.get("promote_existing", record_auto_enroll))
             existing = threads.get(thread_key)
             if existing is None:
                 status = "preview" if destination_message_id else "unlinked"
                 threads[thread_key] = {
                     "thread_key": thread_key,
+                    "mapping_key": mapping_key,
+                    "direction": direction,
+                    "counterpart_thread_key": counterpart_thread_key,
                     "flow": flow,
+                    "source_language": source_language or None,
                     "target_language": target_language,
                     "source": deepcopy(source),
                     "destination": deepcopy(destination),
-                    "origin": "repost_history" if destination_message_id else "manual_repost_history",
-                    "enabled": bool(auto_enroll and destination_message_id),
-                    "start_mode": "backfill_all" if auto_enroll and destination_message_id else None,
+                    "origin": reply_sync.get("origin")
+                    or ("repost_history" if destination_message_id else "manual_repost_history"),
+                    "enabled": bool(record_auto_enroll and destination_message_id),
+                    "start_mode": "backfill_all" if record_auto_enroll and destination_message_id else None,
                     "baseline_pending": False,
                     "baseline_reply_ids": [],
-                    "status": "active" if auto_enroll and destination_message_id else status,
+                    "status": "active" if record_auto_enroll and destination_message_id else status,
                     "last_scan_at": None,
                     "last_contiguous_sequence": -1,
                     "blocked_reply_id": None,
@@ -114,6 +130,8 @@ class ThreadRegistry:
             else:
                 changed = False
                 for field, value in (
+                    ("mapping_key", mapping_key),
+                    ("direction", direction),
                     ("flow", flow),
                     ("target_language", target_language),
                     ("source", deepcopy(source)),
@@ -121,10 +139,34 @@ class ThreadRegistry:
                     if existing.get(field) != value:
                         existing[field] = value
                         changed = True
+                if source_language and existing.get("source_language") != source_language:
+                    existing["source_language"] = source_language
+                    changed = True
+                if counterpart_thread_key and existing.get("counterpart_thread_key") != counterpart_thread_key:
+                    existing["counterpart_thread_key"] = counterpart_thread_key
+                    changed = True
                 if destination_message_id and existing.get("destination") != destination:
                     existing["destination"] = deepcopy(destination)
                     if existing.get("status") == "unlinked":
                         existing["status"] = "preview"
+                    changed = True
+                if (
+                    promote_existing
+                    and destination_message_id
+                    and not existing.get("enabled")
+                    and existing.get("status") == "preview"
+                ):
+                    existing.update(
+                        {
+                            "enabled": True,
+                            "start_mode": "backfill_all",
+                            "baseline_pending": False,
+                            "baseline_reply_ids": [],
+                            "status": "active",
+                            "blocked_reply_id": None,
+                            "error": None,
+                        }
+                    )
                     changed = True
                 if changed:
                     existing["updated_at"] = now
@@ -239,6 +281,13 @@ class ReplyHistory:
                 return record
         return None
 
+    def destination_reply_ids(self, thread_key: str) -> set[str]:
+        return {
+            str(record["destination_reply_id"])
+            for record in self.list_records(thread_key)
+            if record.get("destination_reply_id") and _is_completed_history_record(record)
+        }
+
     def upsert(self, record: dict[str, Any]) -> dict[str, Any]:
         data = self._load()
         records = data["records"]
@@ -273,3 +322,7 @@ def _thread_key(source: dict[str, Any], target_language: str) -> str:
             f"translation:{target_language}",
         ]
     )
+
+
+def _is_completed_history_record(record: dict[str, Any]) -> bool:
+    return record.get("status") in {"sent", "degraded", "recovered"}

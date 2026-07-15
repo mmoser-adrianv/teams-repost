@@ -71,6 +71,7 @@ def build_repost_record(
     destination_channel_id: str,
     report: dict[str, Any],
     target_language: str | None = None,
+    source_language: str | None = None,
 ) -> dict[str, Any]:
     source_message_id = report["source_message_id"]
     record = {
@@ -103,6 +104,8 @@ def build_repost_record(
         record["translation"] = {
             "target_language": target_language,
         }
+        if source_language:
+            record["translation"]["source_language"] = source_language
     return record
 
 
@@ -113,6 +116,7 @@ def build_manual_repost_record(
     destination_channel_id: str,
     cached_post: dict[str, Any],
     target_language: str | None = None,
+    source_language: str | None = None,
 ) -> dict[str, Any]:
     source_message_id = cached_post["id"]
     record = {
@@ -144,6 +148,8 @@ def build_manual_repost_record(
         record["translation"] = {
             "target_language": target_language,
         }
+        if source_language:
+            record["translation"]["source_language"] = source_language
     return record
 
 

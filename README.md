@@ -14,7 +14,7 @@ These payloads and endpoints were checked against Microsoft Graph documentation 
 - File attachments: source `reference` attachments are attached to the repost as native Teams `reference` attachment cards using their original `contentUrl`.
 - List source channel messages: `GET /teams/{team-id}/channels/{channel-id}/messages`
 
-Inline images are recreated when Microsoft Graph can accept them in the channel-message payload. Oversized inline media, GIFs, and other unsupported inline hosted-content types are omitted with an in-message source link placeholder and a saved warning so automation can continue without retrying the same post forever. File attachments are required to attach natively as Teams attachment cards; unsupported attachment types block the repost instead of becoming text links.
+Inline images are recreated when Microsoft Graph can accept them in the channel-message payload. Oversized inline media, GIFs, and other unsupported inline hosted-content types are omitted with an in-message source link placeholder and a saved warning so automation can continue without retrying the same post forever. Non-portable Teams connector and tab cards are omitted with a saved warning because the repost already links to the original message. File attachments are still required to attach natively as Teams attachment cards; unsupported file attachment types block the repost instead of becoming text links.
 
 ## Setup
 
@@ -66,6 +66,12 @@ Both manager pages automatically skip posts whose body text starts with `原文�
 The isolated reply manager is available at `/reply-sync`. It reads successful top-level mappings from `REPOST_HISTORY_PATH`, but stores its registry, reply cache, reply history, temporary files, and automation lock separately under `.data/reply-sync/`. Existing post cache and repost history files are never rewritten by the reply module.
 
 Reply automation is disabled by default. Discovery creates preview entries only; each translated thread must be activated as either `backfill_all` or `future_only`. The worker fetches every Microsoft Graph reply page, sorts replies oldest-first, requires two identical complete scans, and blocks later replies in a thread when an earlier reply fails. Supported JPEG/PNG inline images and `reference` attachments are recreated; unsupported content requires an explicit degraded send from the reply manager.
+
+Set `REPLY_SYNC_AUTO_ENROLL_NEW_THREADS=true` to activate newly discovered mappings with `backfill_all`. Enabling it also promotes existing `preview` mappings on the next discovery pass, while threads that were explicitly paused remain paused.
+
+Reciprocal reply synchronization is separately protected by `REPLY_SYNC_RETURN_ENABLED=false`. When enabled, each fully linked mapping gets a return thread whose source is the translated post and whose destination is the original post. Replies created by either paired thread are excluded from the other thread using reply history, preventing translation loops. Return threads are independent, so a return-side failure does not pause the existing original-to-translated thread.
+
+For a staged rollout, enable `REPLY_SYNC_RETURN_ENABLED`, discover mappings, and activate one selected return thread with `backfill_all`. Other historical return threads remain previews. After the pilot, `REPLY_SYNC_RETURN_AUTO_ENROLL_NEW_THREADS=true` activates only newly discovered return threads; it deliberately does not promote existing return previews. Setting `REPLY_SYNC_RETURN_ENABLED=false` makes all retained return threads dormant without deleting their registry, cache, or history state.
 
 Run one pass only after testing the manager and setting `REPLY_SYNC_ENABLED=true`:
 

@@ -31,6 +31,21 @@ ANNOUNCEMENT_BANNER_ATTACHMENT = {
     "contentType": "application/vnd.microsoft.teams.messaging-announcementBanner",
 }
 
+NONPORTABLE_TEAMS_CARD_ATTACHMENTS = [
+    {
+        "id": "connector-card-1",
+        "name": "attachment-1",
+        "contentType": "application/vnd.microsoft.teams.card.o365connector",
+        "content": "{\"title\":\"Legacy connector card\"}",
+    },
+    {
+        "id": "tab-card-1",
+        "name": "Project tab",
+        "contentType": "tabReference",
+        "contentUrl": "https://teams.microsoft.com/l/entity/app/tab",
+    },
+]
+
 
 class FakeGraph:
     def __init__(self, attachment: dict | None = None) -> None:
@@ -280,7 +295,89 @@ class ForwarderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["attachment_statuses"][0]["status"], "omitted_announcement_banner")
         self.assertIsNone(graph.created_payload)
 
+    async def test_repost_omits_nonportable_teams_cards_without_blocking(self) -> None:
+        settings = Settings(
+            AZURE_TENANT_ID="tenant",
+            AZURE_CLIENT_ID="client",
+            DESTINATION_TEAM_ID="dest-team",
+            DESTINATION_CHANNEL_ID="dest-channel",
+        )
+        request = Request(
+            source_message_url=(
+                "https://teams.microsoft.com/l/message/19%3Asource%40thread.tacv2/msg-1"
+                "?groupId=source-team"
+            )
+        )
+
+        for attachment in NONPORTABLE_TEAMS_CARD_ATTACHMENTS:
+            with self.subTest(content_type=attachment["contentType"]):
+                graph = FakeGraph(attachment)
+
+                report = await forward_message(request, graph, settings)
+
+                self.assertEqual(report["new_message_id"], "new-message")
+                self.assertEqual(report["attachment_statuses"][0]["status"], "omitted_nonportable_teams_card")
+                self.assertTrue(any("link to the original message" in warning for warning in report["warnings"]))
+                self.assertNotIn("attachments", graph.created_payload)
+                self.assertNotIn("<attachment", graph.created_payload["body"]["content"])
+
+    async def test_translated_repost_omits_o365_connector_card_without_blocking(self) -> None:
+        settings = Settings(AZURE_TENANT_ID="tenant", AZURE_CLIENT_ID="client")
+        graph = FakeGraph(NONPORTABLE_TEAMS_CARD_ATTACHMENTS[0])
+        parsed = TeamsMessageLink(
+            tenant_id=None,
+            team_id="source-team",
+            source_channel_thread_id="source-channel",
+            message_id="msg-1",
+            parent_message_id=None,
+            raw_url="https://teams.microsoft.com/source",
+        )
+
+        report = await repost_translated_message(
+            parsed,
+            DestinationChannel("dest-team", "dest-channel"),
+            graph,
+            settings,
+            {
+                "subject": "Translated connector subject",
+                "body_html": "<p>Translated connector body</p>",
+            },
+            "zh-Hans",
+        )
+
+        self.assertEqual(report["new_message_id"], "new-message")
+        self.assertEqual(report["attachment_statuses"][0]["status"], "omitted_nonportable_teams_card")
+        self.assertTrue(any("link to the original message" in warning for warning in report["warnings"]))
+        self.assertNotIn("attachments", graph.created_payload)
+        self.assertIn("Translated connector body", graph.created_payload["body"]["content"])
+        self.assertNotIn("<attachment", graph.created_payload["body"]["content"])
+
+    async def test_dry_run_reports_nonportable_teams_card_as_omitted(self) -> None:
+        settings = Settings(
+            AZURE_TENANT_ID="tenant",
+            AZURE_CLIENT_ID="client",
+            DESTINATION_TEAM_ID="dest-team",
+            DESTINATION_CHANNEL_ID="dest-channel",
+        )
+        graph = FakeGraph(NONPORTABLE_TEAMS_CARD_ATTACHMENTS[0])
+        request = Request(
+            source_message_url=(
+                "https://teams.microsoft.com/l/message/19%3Asource%40thread.tacv2/msg-1"
+                "?groupId=source-team"
+            ),
+            mode="dry_run",
+        )
+
+        report = await forward_message(request, graph, settings)
+
+        self.assertFalse(report["would_post"])
+        self.assertEqual(report["attachment_statuses"][0]["status"], "omitted_nonportable_teams_card")
+        self.assertTrue(any("link to the original message" in warning for warning in report["warnings"]))
+        self.assertIsNone(graph.created_payload)
+
     async def test_repost_rejects_unsupported_attachments_before_posting(self) -> None:
+        self.assertEqual(build_reference_attachments(NONPORTABLE_TEAMS_CARD_ATTACHMENTS), [])
+
         with self.assertRaises(AttachmentRepostError):
             build_reference_attachments(
                 [

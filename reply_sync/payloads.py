@@ -19,7 +19,9 @@ GRAPH_PAYLOAD_TARGET_BYTES = GRAPH_PAYLOAD_LIMIT_BYTES - (64 * 1024)
 SUPPORTED_INLINE_TYPES = {"image/jpg", "image/jpeg", "image/png"}
 ENGLISH_REPLY_SOURCE_PREFIX = "Reply source:"
 CHINESE_REPLY_SOURCE_PREFIX = "回覆來源："
-LEGACY_REPLY_AUTHOR_PREFIXES = ("Original reply by:", "原回覆作者：")
+ENGLISH_REPLY_AUTHOR_PREFIX = "Original reply by:"
+CHINESE_REPLY_AUTHOR_PREFIX = "原回覆作者："
+REPLY_AUTHOR_PREFIXES = (ENGLISH_REPLY_AUTHOR_PREFIX, CHINESE_REPLY_AUTHOR_PREFIX)
 REPLY_SOURCE_MARKER_PREFIX = "reply-source:"
 LEGACY_REPLY_SOURCE_MARKER_PREFIX = "reply-sync-source:"
 
@@ -32,6 +34,8 @@ def build_reply_payload(
     reply: dict[str, Any],
     translation: dict[str, Any],
     hosted_downloads: dict[str, tuple[bytes, str]],
+    *,
+    target_language: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     translated_body = str(translation.get("body_html") or "")
     refs = find_hosted_content_refs(str(reply.get("body_html") or ""))
@@ -57,7 +61,7 @@ def build_reply_payload(
         )
 
     attachments = _reference_attachments(reply.get("attachments") or [])
-    body = _audit_line(reply) + replace_hosted_content_refs(translated_body, uploads)
+    body = _audit_line(reply, target_language) + replace_hosted_content_refs(translated_body, uploads)
     body = append_attachment_placeholders(body, attachments)
     payload: dict[str, Any] = {"body": {"contentType": "html", "content": body}}
     if uploads:
@@ -77,7 +81,12 @@ def build_reply_payload(
     }
 
 
-def build_degraded_reply_payload(reply: dict[str, Any], translation: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def build_degraded_reply_payload(
+    reply: dict[str, Any],
+    translation: dict[str, Any],
+    *,
+    target_language: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     translated_body = str(translation.get("body_html") or "")
     refs = find_hosted_content_refs(str(reply.get("body_html") or ""))
     source_url = str(reply.get("web_url") or "")
@@ -85,7 +94,7 @@ def build_degraded_reply_payload(reply: dict[str, Any], translation: dict[str, A
         ref.occurrence: _source_link(source_url, f"Inline image {ref.occurrence} in original reply")
         for ref in refs
     }
-    body = _audit_line(reply) + replace_hosted_content_refs(translated_body, [], placeholders)
+    body = _audit_line(reply, target_language) + replace_hosted_content_refs(translated_body, [], placeholders)
     attachment_links: list[str] = []
     for index, attachment in enumerate(reply.get("attachments") or [], start=1):
         name = html.escape(str(attachment.get("name") or f"Attachment {index}"))
@@ -116,25 +125,22 @@ def marker_candidates(reply: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
-def _audit_line(reply: dict[str, Any]) -> str:
-    target_language = str(reply.get("target_language") or "")
+def _audit_line(reply: dict[str, Any], target_language: str | None = None) -> str:
+    language_value = reply.get("target_language") if target_language is None else target_language
+    resolved_language = str(language_value or "").strip()
+    if not resolved_language:
+        raise ReplyFidelityError("Reply target language is missing; refusing to choose a header language")
     author = html.escape(str(reply.get("author") or "Unknown"))
     source_url = str(reply.get("web_url") or "")
     reply_id = html.escape(str(reply.get("id") or ""))
-    if target_language.lower().startswith("en"):
-        source_label = ENGLISH_REPLY_SOURCE_PREFIX
-        author_label = "Original reply by:"
-        link_label = "Original reply"
+    language_code = resolved_language.lower().replace("_", "-").split("-", 1)[0]
+    if language_code == "en":
+        author_label = ENGLISH_REPLY_AUTHOR_PREFIX
     else:
-        source_label = CHINESE_REPLY_SOURCE_PREFIX
-        author_label = "原回覆作者："
-        link_label = "原回覆"
+        author_label = CHINESE_REPLY_AUTHOR_PREFIX
     marker = f"{REPLY_SOURCE_MARKER_PREFIX}{reply_id}"
-    link = _source_link(source_url, link_label) if source_url else f"{link_label} ({marker})"
-    return (
-        f"<p><strong>{source_label}</strong> {link}<br>"
-        f"<strong>{author_label}</strong> {author}</p>"
-    )
+    link = _source_link(source_url, "link") if source_url else f"link ({marker})"
+    return f"<p><strong>{author_label}</strong> {author} · {link}</p><hr>"
 
 
 def _reference_attachments(attachments: list[dict[str, Any]]) -> list[ReferenceAttachment]:

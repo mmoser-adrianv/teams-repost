@@ -16,6 +16,11 @@ class ReplySyncSettings(BaseSettings):
     enabled: bool = Field(default=False, alias="REPLY_SYNC_ENABLED")
     flows: str = Field(default="forward,reverse", alias="REPLY_SYNC_FLOWS")
     auto_enroll_new_threads: bool = Field(default=False, alias="REPLY_SYNC_AUTO_ENROLL_NEW_THREADS")
+    return_enabled: bool = Field(default=False, alias="REPLY_SYNC_RETURN_ENABLED")
+    return_auto_enroll_new_threads: bool = Field(
+        default=False,
+        alias="REPLY_SYNC_RETURN_AUTO_ENROLL_NEW_THREADS",
+    )
     stability_scans: int = Field(default=2, alias="REPLY_SYNC_STABILITY_SCANS", ge=1, le=10)
     max_replies_per_run: int = Field(default=50, alias="REPLY_SYNC_MAX_REPLIES_PER_RUN", ge=1, le=500)
     registry_path: Path = Field(

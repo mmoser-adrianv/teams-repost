@@ -1,4 +1,4 @@
-const state = { signedIn: false, enabled: false, threads: [] };
+const state = { signedIn: false, enabled: false, returnEnabled: false, threads: [] };
 
 const authStatus = document.querySelector("#authStatus");
 const loginLink = document.querySelector("#loginLink");
@@ -33,6 +33,7 @@ async function loadThreads() {
   if (!state.signedIn) return;
   const payload = await api("/api/reply-sync/threads");
   state.enabled = payload.enabled;
+  state.returnEnabled = payload.return_enabled;
   state.threads = payload.threads || [];
   automationBanner.classList.toggle("hidden", state.enabled);
   if (state.enabled) {
@@ -52,8 +53,10 @@ function render() {
 
 function renderThread(thread) {
   const node = template.content.firstElementChild.cloneNode(true);
+  const direction = thread.direction === "return" ? "return" : "primary";
+  const directionAvailable = thread.status !== "superseded" && (direction !== "return" || state.returnEnabled);
   node.querySelector(".thread-title").textContent = thread.source?.subject || thread.source?.message_id || "Translated thread";
-  node.querySelector(".thread-meta").textContent = `${thread.flow} · ${thread.target_language} · ${thread.origin}`;
+  node.querySelector(".thread-meta").textContent = `${direction} · ${thread.flow} · ${thread.target_language} · ${thread.origin}`;
   node.querySelector(".badge").textContent = thread.status || "preview";
   const metrics = node.querySelector(".metrics");
   for (const [label, value] of [
@@ -73,14 +76,14 @@ function renderThread(thread) {
     error.classList.remove("hidden");
   }
   const links = node.querySelector(".links");
-  addLink(links, "Source post", thread.source?.web_url);
-  addLink(links, "Translated post", thread.destination?.web_url);
+  addLink(links, direction === "return" ? "Translated post" : "Source post", thread.source?.web_url);
+  addLink(links, direction === "return" ? "Original post" : "Translated post", thread.destination?.web_url);
   const actions = node.querySelector(".actions");
   if (!thread.destination?.message_id) {
     addButton(actions, "Link destination", () => linkDestination(thread));
   } else if (!thread.enabled) {
-    addButton(actions, "Backfill all", () => activate(thread, "backfill_all"));
-    addButton(actions, "Future only", () => activate(thread, "future_only"), "secondary");
+    addButton(actions, "Backfill all", () => activate(thread, "backfill_all"), "", !directionAvailable);
+    addButton(actions, "Future only", () => activate(thread, "future_only"), "secondary", !directionAvailable);
   } else {
     addButton(actions, "Run now", () => act(`/api/reply-sync/threads/${encodeURIComponent(thread.thread_key)}/run`), "secondary", !state.enabled);
     addButton(actions, "Pause", () => act(`/api/reply-sync/threads/${encodeURIComponent(thread.thread_key)}/pause`), "secondary");

@@ -960,6 +960,7 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(attachment["contentType"], "reference")
         self.assertEqual(attachment["contentUrl"], "https://contoso.sharepoint.com/source.docx")
         self.assertEqual(response.json()["record"]["source_key"], "source-team|19:source@thread.tacv2|msg-1|translation:zh-Hans")
+        self.assertEqual(response.json()["record"]["translation"]["source_language"], "en")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "attached_reference")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["id"], attachment["id"])
         self.assertEqual(self.graph.file_api_calls, [])
@@ -1016,6 +1017,64 @@ class MainApiTests(unittest.TestCase):
                 "source-team",
                 "19:source@thread.tacv2",
                 "announcement-msg",
+                "zh-Hans",
+            )
+        )
+
+    def test_create_repost_omits_o365_connector_card_without_blocking(self) -> None:
+        connector_attachment = {
+            "id": "connector-card-1",
+            "name": "attachment-1",
+            "contentType": "application/vnd.microsoft.teams.card.o365connector",
+            "content": "{\"title\":\"Legacy connector card\"}",
+        }
+        cached_post = {
+            **self._cached_post("connector-msg", "2026-06-01T01:02:03Z"),
+            "attachments": [
+                {
+                    "id": connector_attachment["id"],
+                    "name": connector_attachment["name"],
+                    "content_type": connector_attachment["contentType"],
+                    "content_url": None,
+                }
+            ],
+        }
+        cache = PostCache(main.settings.post_cache_path)
+        cache.upsert_posts("source-team", "19:source@thread.tacv2", [cached_post])
+        cache.upsert_translation(
+            "source-team",
+            "19:source@thread.tacv2",
+            "connector-msg",
+            "zh-Hans",
+            {
+                "subject": "Chinese connector subject",
+                "body_html": "<p>Chinese connector body</p>",
+                "body_preview": "Chinese connector body",
+            },
+        )
+        self.graph.messages["connector-msg"] = {
+            "subject": "Connector subject",
+            "body": {
+                "contentType": "html",
+                "content": '<p>Connector body</p><attachment id="connector-card-1"></attachment>',
+            },
+            "attachments": [connector_attachment],
+        }
+
+        response = self.client.post("/api/reposts", json={"source_message_id": "connector-msg"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = self.graph.created_payloads[0]
+        self.assertNotIn("attachments", payload)
+        self.assertNotIn("<attachment", payload["body"]["content"])
+        record = response.json()["record"]
+        self.assertEqual(record["attachment_statuses"][0]["status"], "omitted_nonportable_teams_card")
+        self.assertTrue(any("link to the original message" in warning for warning in record["warnings"]))
+        self.assertIsNotNone(
+            RepostHistory(main.settings.repost_history_path).get(
+                "source-team",
+                "19:source@thread.tacv2",
+                "connector-msg",
                 "zh-Hans",
             )
         )
@@ -1159,6 +1218,7 @@ class MainApiTests(unittest.TestCase):
         self.assertIn('src="../hostedContents/1/$value"', payload["body"]["content"])
         self.assertEqual(response.json()["record"]["source_key"], "dest-team|19:dest@thread.tacv2|msg-1|translation:en")
         self.assertEqual(response.json()["record"]["translation"]["target_language"], "en")
+        self.assertEqual(response.json()["record"]["translation"]["source_language"], "zh-Hans")
 
     def test_successful_create_repost_is_saved_into_post_status(self) -> None:
         cache = PostCache(main.settings.post_cache_path)
@@ -1201,6 +1261,7 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(mark_response.json()["status"], "marked_reposted")
         self.assertEqual(record["status"], "manually_marked")
         self.assertTrue(record["manual"])
+        self.assertEqual(record["translation"]["source_language"], "en")
 
         post = posts_response.json()["posts"][0]
         self.assertTrue(post["reposted"])

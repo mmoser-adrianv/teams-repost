@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -17,8 +18,8 @@ from .graph import ReplyGraph
 from .payloads import (
     CHINESE_REPLY_SOURCE_PREFIX,
     ENGLISH_REPLY_SOURCE_PREFIX,
-    LEGACY_REPLY_AUTHOR_PREFIXES,
     LEGACY_REPLY_SOURCE_MARKER_PREFIX,
+    REPLY_AUTHOR_PREFIXES,
     REPLY_SOURCE_MARKER_PREFIX,
     ReplyFidelityError,
     build_degraded_reply_payload,
@@ -29,6 +30,10 @@ from .stores import ReplyCache, ReplyHistory, ThreadRegistry, utc_now
 
 
 Translator = Callable[[dict[str, Any], str, Any], Awaitable[dict[str, Any]]]
+RETURN_THREAD_SUFFIX = "|reply:return"
+
+
+logger = logging.getLogger(__name__)
 
 
 class ReplySyncError(RuntimeError):
@@ -55,11 +60,15 @@ class ReplySyncService:
 
     def discover(self) -> dict[str, int]:
         records = RepostHistory(self.core_settings.repost_history_path).list_records()
-        return self.registry.discover(
-            records,
+        result = self.registry.discover(
+            self._prepare_discovery_records(records),
             set(self.reply_settings.flow_list),
             self.reply_settings.auto_enroll_new_threads,
         )
+        superseded = self._retire_superseded_return_threads()
+        result["updated"] += superseded
+        result["superseded"] = superseded
+        return result
 
     def list_threads(self) -> dict[str, Any]:
         threads = []
@@ -77,16 +86,21 @@ class ReplySyncService:
                     "queued_reply_count": len(queued),
                     "completed_reply_count": len(completed),
                     "stable_scans": int(cache.get("stable_scans") or 0),
-                    "automation_enabled": self.reply_settings.enabled,
+                    "automation_enabled": self.reply_settings.enabled and self._direction_enabled(thread),
                 }
             )
             threads.append(summary)
-        return {"enabled": self.reply_settings.enabled, "threads": threads}
+        return {
+            "enabled": self.reply_settings.enabled,
+            "return_enabled": self.reply_settings.return_enabled,
+            "threads": threads,
+        }
 
     def activate(self, thread_key: str, start_mode: str) -> dict[str, Any]:
         if start_mode not in {"backfill_all", "future_only"}:
             raise ValueError("start_mode must be backfill_all or future_only")
         thread = self._thread(thread_key)
+        self._assert_direction_enabled(thread)
         if not (thread.get("destination") or {}).get("message_id"):
             raise ValueError("Thread must be linked to a destination post before activation")
         changes: dict[str, Any] = {
@@ -107,17 +121,22 @@ class ReplySyncService:
         return self.registry.update(thread_key, **changes)
 
     def pause(self, thread_key: str) -> dict[str, Any]:
-        self._thread(thread_key)
+        thread = self._thread(thread_key)
+        if thread.get("status") == "superseded":
+            raise ValueError("Reply-sync thread was superseded by an exact reverse mapping")
         return self.registry.update(thread_key, enabled=False, status="paused")
 
     def retry(self, thread_key: str) -> dict[str, Any]:
         thread = self._thread(thread_key)
+        self._assert_direction_enabled(thread)
         if not thread.get("enabled"):
             raise ValueError("Thread must be active before retrying")
         return self.registry.update(thread_key, status="active", blocked_reply_id=None, error=None)
 
     async def link_destination(self, thread_key: str, destination_url: str, graph: ReplyGraph) -> dict[str, Any]:
         thread = self._thread(thread_key)
+        if thread.get("status") == "superseded":
+            raise ValueError("Reply-sync thread was superseded by an exact reverse mapping")
         try:
             parsed = parse_teams_message_url(destination_url)
         except TeamsUrlParseError as exc:
@@ -136,7 +155,7 @@ class ReplySyncService:
             "message_id": parsed.message_id,
             "web_url": message.get("webUrl") or destination_url,
         }
-        return self.registry.update(
+        linked = self.registry.update(
             thread_key,
             destination=destination,
             origin="manual_link",
@@ -144,13 +163,16 @@ class ReplySyncService:
             enabled=False,
             error=None,
         )
+        if self.reply_settings.return_enabled and linked.get("direction", "primary") == "primary":
+            linked = self._ensure_return_thread(linked)
+        return linked
 
     async def run_all(self, graph: ReplyGraph) -> dict[str, Any]:
         discovery = self.discover()
         remaining = self.reply_settings.max_replies_per_run
         results: list[dict[str, Any]] = []
         for thread in self.registry.list_threads():
-            if not thread.get("enabled") or remaining <= 0:
+            if not self._direction_enabled(thread) or not thread.get("enabled") or remaining <= 0:
                 continue
             result = await self.run_thread(thread["thread_key"], graph, remaining)
             remaining -= int(result.get("sent") or 0) + int(result.get("recovered") or 0)
@@ -166,6 +188,10 @@ class ReplySyncService:
 
     async def run_thread(self, thread_key: str, graph: ReplyGraph, limit: int | None = None) -> dict[str, Any]:
         thread = self._thread(thread_key)
+        if thread.get("status") == "superseded":
+            return {"thread_key": thread_key, "status": "superseded", "sent": 0, "recovered": 0}
+        if not self._direction_enabled(thread):
+            return {"thread_key": thread_key, "status": "return_disabled", "sent": 0, "recovered": 0}
         if not thread.get("enabled"):
             return {"thread_key": thread_key, "status": "paused", "sent": 0, "recovered": 0}
         destination = thread.get("destination") or {}
@@ -173,13 +199,17 @@ class ReplySyncService:
             return self._block(thread_key, None, "Destination post is not linked")
 
         source = thread["source"]
+        counterpart_thread_key = thread.get("counterpart_thread_key")
+        paired_destination_ids = (
+            self.history.destination_reply_ids(str(counterpart_thread_key)) if counterpart_thread_key else set()
+        )
         try:
             listed = await graph.list_replies(source["team_id"], source["channel_id"], source["message_id"])
             normalized = sorted(
                 (
                     _normalize_reply(reply, thread["target_language"])
                     for reply in listed
-                    if _is_user_reply(reply) and not _is_translated_reply(reply)
+                    if _is_user_reply(reply) and not _is_translated_reply(reply, paired_destination_ids)
                 ),
                 key=_reply_sort_key,
             )
@@ -244,7 +274,12 @@ class ReplySyncService:
                     continue
 
                 hosted = await self._download_hosted_contents(graph, thread, reply)
-                payload, fidelity = build_reply_payload(reply, translation, hosted)
+                payload, fidelity = build_reply_payload(
+                    reply,
+                    translation,
+                    hosted,
+                    target_language=thread["target_language"],
+                )
                 created = await graph.create_reply(
                     destination["team_id"], destination["channel_id"], destination["message_id"], payload
                 )
@@ -268,6 +303,7 @@ class ReplySyncService:
 
     async def send_degraded(self, thread_key: str, reply_id: str, graph: ReplyGraph) -> dict[str, Any]:
         thread = self._thread(thread_key)
+        self._assert_direction_enabled(thread)
         if not thread.get("enabled"):
             raise ValueError("Thread must be active before sending a degraded reply")
         if thread.get("blocked_reply_id") != reply_id:
@@ -293,7 +329,11 @@ class ReplySyncService:
             status = "recovered"
             fidelity = {"degraded": True, "reconciled": True}
         else:
-            payload, fidelity = build_degraded_reply_payload(reply, translation)
+            payload, fidelity = build_degraded_reply_payload(
+                reply,
+                translation,
+                target_language=thread["target_language"],
+            )
             created = await graph.create_reply(
                 destination["team_id"], destination["channel_id"], destination["message_id"], payload
             )
@@ -337,6 +377,8 @@ class ReplySyncService:
     ) -> dict[str, Any]:
         record = {
             "thread_key": thread["thread_key"],
+            "mapping_key": thread.get("mapping_key") or thread["thread_key"],
+            "direction": thread.get("direction", "primary"),
             "source_reply_id": reply["id"],
             "source_created_date_time": reply.get("created_date_time"),
             "source_etag": reply.get("etag"),
@@ -404,6 +446,170 @@ class ReplySyncService:
             "error": error,
         }
 
+    def _prepare_discovery_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        eligible_primary_records: list[dict[str, Any]] = []
+        actual_legs: dict[tuple[str, ...], str] = {}
+        flows = set(self.reply_settings.flow_list)
+
+        for raw_record in records:
+            record = deepcopy(raw_record)
+            translation = record.get("translation") or {}
+            target_language = str(translation.get("target_language") or "")
+            if not target_language or _flow_for_target(target_language) not in flows:
+                prepared.append(record)
+                continue
+            thread_key = _record_thread_key(record, target_language)
+            source_language = _source_language_for_record(record, self.core_settings)
+            metadata = deepcopy(record.get("reply_sync") or {})
+            metadata.update(
+                {
+                    "mapping_key": metadata.get("mapping_key") or thread_key,
+                    "direction": "primary",
+                    "source_language": source_language,
+                    "auto_enroll": self.reply_settings.auto_enroll_new_threads,
+                    "promote_existing": self.reply_settings.auto_enroll_new_threads,
+                }
+            )
+            record["reply_sync"] = metadata
+            prepared.append(record)
+            eligible_primary_records.append(record)
+            identity = _leg_identity(record.get("source") or {}, record.get("destination") or {}, target_language)
+            if identity:
+                actual_legs.setdefault(identity, thread_key)
+
+        if not self.reply_settings.return_enabled:
+            return prepared
+
+        reciprocal_records: list[dict[str, Any]] = []
+        for record in eligible_primary_records:
+            target_language = str((record.get("translation") or {}).get("target_language") or "")
+            source_language = str((record.get("reply_sync") or {}).get("source_language") or "")
+            primary_key = _record_thread_key(record, target_language)
+            source = record.get("source") or {}
+            destination = record.get("destination") or {}
+            if not destination.get("message_id"):
+                continue
+            if not source_language:
+                logger.warning(
+                    "Skipping reciprocal reply-sync discovery for %s because its source language cannot be inferred",
+                    primary_key,
+                )
+                continue
+            if _flow_for_target(source_language) not in flows:
+                continue
+
+            reciprocal_identity = _leg_identity(destination, source, source_language)
+            actual_counterpart = actual_legs.get(reciprocal_identity) if reciprocal_identity else None
+            if actual_counterpart and actual_counterpart != primary_key:
+                record["reply_sync"]["counterpart_thread_key"] = actual_counterpart
+                continue
+
+            return_record = _build_return_record(
+                record,
+                primary_key,
+                source_language,
+                self.reply_settings.return_auto_enroll_new_threads,
+            )
+            if not return_record:
+                continue
+            return_key = str(return_record["source_key"])
+            record["reply_sync"]["counterpart_thread_key"] = return_key
+            reciprocal_records.append(return_record)
+
+        return prepared + reciprocal_records
+
+    def _ensure_return_thread(self, primary: dict[str, Any]) -> dict[str, Any]:
+        source_language = str(primary.get("source_language") or "")
+        if not source_language:
+            source_language = _source_language_for_target(str(primary.get("target_language") or ""), self.core_settings)
+        if not source_language or _flow_for_target(source_language) not in set(self.reply_settings.flow_list):
+            return primary
+
+        desired_identity = _leg_identity(
+            primary.get("destination") or {},
+            primary.get("source") or {},
+            source_language,
+        )
+        for candidate in self.registry.list_threads():
+            if candidate["thread_key"] == primary["thread_key"] or candidate.get("direction", "primary") != "primary":
+                continue
+            candidate_identity = _leg_identity(
+                candidate.get("source") or {},
+                candidate.get("destination") or {},
+                str(candidate.get("target_language") or ""),
+            )
+            if desired_identity and candidate_identity == desired_identity:
+                self.registry.update(candidate["thread_key"], counterpart_thread_key=primary["thread_key"])
+                return self.registry.update(primary["thread_key"], counterpart_thread_key=candidate["thread_key"])
+
+        primary_record = {
+            "source_key": primary["thread_key"],
+            "source": deepcopy(primary.get("source") or {}),
+            "destination": deepcopy(primary.get("destination") or {}),
+            "translation": {
+                "source_language": source_language,
+                "target_language": primary.get("target_language"),
+            },
+            "reposted_at": primary.get("updated_at"),
+        }
+        return_record = _build_return_record(
+            primary_record,
+            primary["thread_key"],
+            source_language,
+            self.reply_settings.return_auto_enroll_new_threads,
+        )
+        if not return_record:
+            return primary
+        self.registry.discover([return_record], set(self.reply_settings.flow_list), False)
+        return_key = str(return_record["source_key"])
+        if not self.registry.get(return_key):
+            return primary
+        return self.registry.update(primary["thread_key"], counterpart_thread_key=return_key)
+
+    def _retire_superseded_return_threads(self) -> int:
+        threads = self.registry.list_threads()
+        primaries = {
+            thread["thread_key"]: thread
+            for thread in threads
+            if thread.get("direction", "primary") == "primary"
+        }
+        retired = 0
+        for primary in primaries.values():
+            counterpart_key = primary.get("counterpart_thread_key")
+            if counterpart_key not in primaries:
+                continue
+            synthetic_key = primary["thread_key"] + RETURN_THREAD_SUFFIX
+            synthetic = self.registry.get(synthetic_key)
+            if not synthetic or synthetic.get("direction") != "return":
+                continue
+            if (
+                synthetic.get("status") == "superseded"
+                and not synthetic.get("enabled")
+                and synthetic.get("superseded_by") == counterpart_key
+            ):
+                continue
+            self.registry.update(
+                synthetic_key,
+                enabled=False,
+                status="superseded",
+                superseded_by=counterpart_key,
+                error=None,
+            )
+            retired += 1
+        return retired
+
+    def _direction_enabled(self, thread: dict[str, Any]) -> bool:
+        return thread.get("status") != "superseded" and (
+            thread.get("direction", "primary") != "return" or self.reply_settings.return_enabled
+        )
+
+    def _assert_direction_enabled(self, thread: dict[str, Any]) -> None:
+        if thread.get("status") == "superseded":
+            raise ValueError("Reply-sync thread was superseded by an exact reverse mapping")
+        if not self._direction_enabled(thread):
+            raise ValueError("Reciprocal reply synchronization is disabled")
+
     def _thread(self, thread_key: str) -> dict[str, Any]:
         thread = self.registry.get(thread_key)
         if not thread:
@@ -450,12 +656,14 @@ def _is_user_reply(message: dict[str, Any]) -> bool:
     return bool(message.get("id")) and str(message.get("messageType") or "message") == "message"
 
 
-def _is_translated_reply(message: dict[str, Any]) -> bool:
+def _is_translated_reply(message: dict[str, Any], paired_destination_ids: set[str] | None = None) -> bool:
+    if str(message.get("id") or "") in (paired_destination_ids or set()):
+        return True
     body_text = _visible_text(normalize_body_to_html(message))
     translated_prefixes = (
         ENGLISH_REPLY_SOURCE_PREFIX,
         CHINESE_REPLY_SOURCE_PREFIX,
-        *LEGACY_REPLY_AUTHOR_PREFIXES,
+        *REPLY_AUTHOR_PREFIXES,
     )
     return body_text.startswith(translated_prefixes) or any(
         marker in body_text
@@ -484,3 +692,97 @@ def _find_destination_matches(destination_replies: list[dict[str, Any]], source_
 
 def _is_completed(record: dict[str, Any]) -> bool:
     return record.get("status") in {"sent", "degraded", "recovered", "skipped_deleted"}
+
+
+def _flow_for_target(target_language: str) -> str:
+    return "reverse" if _normalized_language(target_language).startswith("en") else "forward"
+
+
+def _normalized_language(language: str) -> str:
+    return str(language or "").strip().lower().replace("_", "-")
+
+
+def _source_language_for_record(record: dict[str, Any], core_settings: Any) -> str | None:
+    translation = record.get("translation") or {}
+    explicit = str(translation.get("source_language") or "").strip()
+    if explicit:
+        return explicit
+    return _source_language_for_target(str(translation.get("target_language") or ""), core_settings)
+
+
+def _source_language_for_target(target_language: str, core_settings: Any) -> str | None:
+    target = _normalized_language(target_language)
+    configured_target = str(getattr(core_settings, "openai_translation_target", "") or "").strip()
+    if target.startswith("en"):
+        return configured_target or None
+    if configured_target and target == _normalized_language(configured_target):
+        return "en"
+    return None
+
+
+def _record_thread_key(record: dict[str, Any], target_language: str) -> str:
+    if record.get("source_key"):
+        return str(record["source_key"])
+    source = record.get("source") or {}
+    return "|".join(
+        [
+            str(source.get("team_id") or ""),
+            str(source.get("channel_id") or ""),
+            str(source.get("message_id") or ""),
+            f"translation:{target_language}",
+        ]
+    )
+
+
+def _leg_identity(
+    source: dict[str, Any],
+    destination: dict[str, Any],
+    target_language: str,
+) -> tuple[str, ...] | None:
+    values = (
+        source.get("team_id"),
+        source.get("channel_id"),
+        source.get("message_id"),
+        destination.get("team_id"),
+        destination.get("channel_id"),
+        destination.get("message_id"),
+    )
+    if not all(values) or not target_language:
+        return None
+    return tuple(str(value) for value in values) + (_normalized_language(target_language),)
+
+
+def _build_return_record(
+    primary_record: dict[str, Any],
+    primary_key: str,
+    source_language: str,
+    auto_enroll: bool = False,
+) -> dict[str, Any] | None:
+    source = primary_record.get("source") or {}
+    destination = primary_record.get("destination") or {}
+    target_language = str((primary_record.get("translation") or {}).get("target_language") or "")
+    if not source.get("message_id") or not destination.get("message_id") or not target_language:
+        return None
+    return_key = primary_key + RETURN_THREAD_SUFFIX
+    return_source = deepcopy(destination)
+    return_source.setdefault("subject", source.get("subject"))
+    return_source.setdefault("created_date_time", primary_record.get("reposted_at"))
+    return {
+        "source_key": return_key,
+        "source": return_source,
+        "destination": deepcopy(source),
+        "translation": {
+            "source_language": target_language,
+            "target_language": source_language,
+        },
+        "reposted_at": primary_record.get("reposted_at"),
+        "reply_sync": {
+            "mapping_key": primary_key,
+            "direction": "return",
+            "counterpart_thread_key": primary_key,
+            "source_language": target_language,
+            "auto_enroll": auto_enroll,
+            "promote_existing": False,
+            "origin": "reciprocal_repost_history",
+        },
+    }

@@ -49,7 +49,15 @@ class RepostHistoryTests(unittest.TestCase):
             }
 
             english_record = build_repost_record("source-team", "source-channel", "dest-team", "dest-channel", report)
-            chinese_record = build_repost_record("source-team", "source-channel", "dest-team", "dest-channel", report, "zh-Hans")
+            chinese_record = build_repost_record(
+                "source-team",
+                "source-channel",
+                "dest-team",
+                "dest-channel",
+                report,
+                "zh-Hans",
+                "en",
+            )
             history.upsert(english_record)
             history.upsert(chinese_record)
 
@@ -57,6 +65,7 @@ class RepostHistoryTests(unittest.TestCase):
             self.assertIsNone(history.get("source-team", "source-channel", "msg-2", "zh-Hans"))
             self.assertIsNotNone(history.get("source-team", "source-channel", "msg-1"))
             self.assertEqual(history.get("source-team", "source-channel", "msg-1", "zh-Hans")["translation"]["target_language"], "zh-Hans")
+            self.assertEqual(history.get("source-team", "source-channel", "msg-1", "zh-Hans")["translation"]["source_language"], "en")
 
     def test_build_manual_repost_record(self) -> None:
         record = build_manual_repost_record(
@@ -73,11 +82,13 @@ class RepostHistoryTests(unittest.TestCase):
                 "attachments": [{"name": "file.docx"}],
             },
             "zh-Hans",
+            "en",
         )
 
         self.assertEqual(record["source_key"], "source-team|source-channel|msg-1|translation:zh-Hans")
         self.assertEqual(record["status"], "manually_marked")
         self.assertTrue(record["manual"])
+        self.assertEqual(record["translation"]["source_language"], "en")
         self.assertIsNone(record["destination"]["message_id"])
         self.assertEqual(record["attachment_links"][0]["name"], "file.docx")
 

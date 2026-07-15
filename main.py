@@ -100,6 +100,7 @@ class RepostFlow:
     name: str
     source: DestinationChannel
     destination: DestinationChannel
+    source_language: str
     target_language: str
     translation_target_label: str
     exception_list_path: Path
@@ -421,6 +422,7 @@ def _repost_flow(flow_name: str) -> RepostFlow:
             name="forward",
             source=_configured_source(),
             destination=_configured_destination(),
+            source_language="en",
             target_language=settings.openai_translation_target,
             translation_target_label="Chinese",
             exception_list_path=settings.exception_list_path,
@@ -431,6 +433,7 @@ def _repost_flow(flow_name: str) -> RepostFlow:
             name="reverse",
             source=_configured_destination(),
             destination=_configured_source(),
+            source_language=settings.openai_translation_target,
             target_language="en",
             translation_target_label="English",
             exception_list_path=_reverse_exception_list_path(),
@@ -542,7 +545,15 @@ async def _create_repost_with_token(flow: RepostFlow, source_message_id: str, ta
         except GraphAPIError as exc:
             raise HTTPException(status_code=_graph_http_status(exc.status_code), detail=str(exc)) from exc
 
-    record = build_repost_record(source.team_id, source.channel_id, destination.team_id, destination.channel_id, report, target_language)
+    record = build_repost_record(
+        source.team_id,
+        source.channel_id,
+        destination.team_id,
+        destination.channel_id,
+        report,
+        target_language,
+        flow.source_language,
+    )
     history.upsert(record)
     return {"status": "reposted", "record": record, "report": report}
 
@@ -575,6 +586,7 @@ async def _mark_repost_manually_for_flow(flow: RepostFlow, payload: ManualRepost
         destination.channel_id,
         cached_post,
         target_language,
+        flow.source_language,
     )
     history.upsert(record)
     return {"status": "marked_reposted", "record": record}

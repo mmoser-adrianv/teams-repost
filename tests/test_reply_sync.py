@@ -81,6 +81,35 @@ class FakeReplyGraph:
         return {"id": message_id, "webUrl": f"https://teams.example/destination/{message_id}"}
 
 
+class PairedReplyGraph(FakeReplyGraph):
+    def __init__(self, replies_by_parent: dict[str, list[dict]]) -> None:
+        super().__init__()
+        self.replies_by_parent = replies_by_parent
+        self.created_with_parent: list[tuple[str, dict]] = []
+
+    async def list_replies(self, team_id, channel_id, parent_message_id):
+        return list(self.replies_by_parent.get(parent_message_id, []))
+
+    async def create_reply(self, team_id, channel_id, parent_message_id, payload):
+        created_number = len(self.created_with_parent) + 1
+        created = {
+            "id": f"generated-{created_number}",
+            "replyToId": parent_message_id,
+            "messageType": "message",
+            "createdDateTime": f"2026-07-13T00:00:{created_number + 10:02d}Z",
+            "lastModifiedDateTime": f"2026-07-13T00:00:{created_number + 10:02d}Z",
+            "etag": f"generated-{created_number}",
+            "webUrl": f"https://teams.example/generated/{created_number}",
+            "from": {"user": {"displayName": "Reply translator"}},
+            "body": payload["body"],
+            "attachments": payload.get("attachments") or [],
+        }
+        self.created.append(payload)
+        self.created_with_parent.append((parent_message_id, created))
+        self.replies_by_parent.setdefault(parent_message_id, []).append(created)
+        return created
+
+
 class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -96,7 +125,10 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.reply_settings.stability_scans = 2
         self.reply_settings.max_replies_per_run = 50
         self.repost_history_path = root / "main-history.json"
-        self.core_settings = SimpleNamespace(repost_history_path=self.repost_history_path)
+        self.core_settings = SimpleNamespace(
+            repost_history_path=self.repost_history_path,
+            openai_translation_target="zh-Hans",
+        )
         self.translation_calls: list[str] = []
         self.service = ReplySyncService(self.reply_settings, self.core_settings, self.translate)
         self.thread_key = "source-team|source-channel|source-parent|translation:zh-Hans"
@@ -112,6 +144,193 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
             "translated_at": "2026-07-13T00:00:00Z",
             "model": "fake",
         }
+
+    def test_auto_enroll_activates_existing_preview_for_backfill(self) -> None:
+        preview = self.service.registry.get(self.thread_key)
+        self.assertFalse(preview["enabled"])
+        self.assertEqual(preview["status"], "preview")
+
+        self.reply_settings.auto_enroll_new_threads = True
+        result = self.service.discover()
+
+        thread = self.service.registry.get(self.thread_key)
+        self.assertEqual(result["updated"], 1)
+        self.assertTrue(thread["enabled"])
+        self.assertEqual(thread["start_mode"], "backfill_all")
+        self.assertEqual(thread["status"], "active")
+        self.assertEqual(thread["baseline_reply_ids"], [])
+
+    def test_auto_enroll_does_not_reactivate_paused_thread(self) -> None:
+        self.service.activate(self.thread_key, "backfill_all")
+        self.service.pause(self.thread_key)
+
+        self.reply_settings.auto_enroll_new_threads = True
+        self.service.discover()
+
+        thread = self.service.registry.get(self.thread_key)
+        self.assertFalse(thread["enabled"])
+        self.assertEqual(thread["status"], "paused")
+
+    def test_reciprocal_discovery_swaps_roots_and_starts_as_preview(self) -> None:
+        self.reply_settings.return_enabled = True
+
+        result = self.service.discover()
+
+        return_key = self.thread_key + "|reply:return"
+        primary = self.service.registry.get(self.thread_key)
+        reciprocal = self.service.registry.get(return_key)
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(primary["counterpart_thread_key"], return_key)
+        self.assertEqual(reciprocal["counterpart_thread_key"], self.thread_key)
+        self.assertEqual(reciprocal["mapping_key"], self.thread_key)
+        self.assertEqual(reciprocal["direction"], "return")
+        self.assertEqual(reciprocal["source"]["message_id"], "destination-parent")
+        self.assertEqual(reciprocal["destination"]["message_id"], "source-parent")
+        self.assertEqual(reciprocal["source_language"], "zh-Hans")
+        self.assertEqual(reciprocal["target_language"], "en")
+        self.assertFalse(reciprocal["enabled"])
+        self.assertEqual(reciprocal["status"], "preview")
+        self.assertEqual(
+            [thread["direction"] for thread in self.service.registry.list_threads()],
+            ["primary", "return"],
+        )
+
+    def test_return_auto_enroll_only_applies_when_return_thread_is_created(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.service.discover()
+        existing_return_key = self.thread_key + "|reply:return"
+
+        self.reply_settings.return_auto_enroll_new_threads = True
+        self.service.discover()
+
+        existing = self.service.registry.get(existing_return_key)
+        self.assertFalse(existing["enabled"])
+        self.assertEqual(existing["status"], "preview")
+
+        new_key = "source-team|source-channel|source-parent-2|translation:zh-Hans"
+        RepostHistory(self.repost_history_path).upsert(
+            {
+                "source_key": new_key,
+                "source": {
+                    "team_id": "source-team",
+                    "channel_id": "source-channel",
+                    "message_id": "source-parent-2",
+                },
+                "destination": {
+                    "team_id": "destination-team",
+                    "channel_id": "destination-channel",
+                    "message_id": "destination-parent-2",
+                },
+                "translation": {"source_language": "en", "target_language": "zh-Hans"},
+            }
+        )
+        self.service.discover()
+
+        newly_created = self.service.registry.get(new_key + "|reply:return")
+        self.assertTrue(newly_created["enabled"])
+        self.assertEqual(newly_created["start_mode"], "backfill_all")
+        self.assertEqual(newly_created["status"], "active")
+
+    def test_reverse_mapping_gets_a_chinese_return_thread(self) -> None:
+        reverse_key = "destination-team|destination-channel|reverse-source|translation:en"
+        RepostHistory(self.repost_history_path).upsert(
+            {
+                "source_key": reverse_key,
+                "source": {
+                    "team_id": "destination-team",
+                    "channel_id": "destination-channel",
+                    "message_id": "reverse-source",
+                },
+                "destination": {
+                    "team_id": "source-team",
+                    "channel_id": "source-channel",
+                    "message_id": "reverse-destination",
+                },
+                "translation": {"source_language": "zh-Hans", "target_language": "en"},
+            }
+        )
+        self.reply_settings.return_enabled = True
+
+        self.service.discover()
+
+        reciprocal = self.service.registry.get(reverse_key + "|reply:return")
+        self.assertEqual(reciprocal["source"]["message_id"], "reverse-destination")
+        self.assertEqual(reciprocal["destination"]["message_id"], "reverse-source")
+        self.assertEqual(reciprocal["target_language"], "zh-Hans")
+        self.assertEqual(reciprocal["flow"], "forward")
+
+    def test_exact_reverse_mapping_is_paired_without_synthetic_threads(self) -> None:
+        reverse_key = "destination-team|destination-channel|destination-parent|translation:en"
+        RepostHistory(self.repost_history_path).upsert(
+            {
+                "source_key": reverse_key,
+                "source": {
+                    "team_id": "destination-team",
+                    "channel_id": "destination-channel",
+                    "message_id": "destination-parent",
+                },
+                "destination": {
+                    "team_id": "source-team",
+                    "channel_id": "source-channel",
+                    "message_id": "source-parent",
+                },
+                "translation": {"source_language": "zh-Hans", "target_language": "en"},
+            }
+        )
+        self.reply_settings.return_enabled = True
+
+        self.service.discover()
+
+        threads = self.service.registry.list_threads()
+        self.assertEqual(len(threads), 2)
+        self.assertTrue(all(thread["direction"] == "primary" for thread in threads))
+        self.assertEqual(self.service.registry.get(self.thread_key)["counterpart_thread_key"], reverse_key)
+        self.assertEqual(self.service.registry.get(reverse_key)["counterpart_thread_key"], self.thread_key)
+
+    def test_existing_synthetic_return_is_retired_when_an_exact_reverse_mapping_appears(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.service.discover()
+        synthetic_key = self.thread_key + "|reply:return"
+        self.service.activate(synthetic_key, "backfill_all")
+        reverse_key = "destination-team|destination-channel|destination-parent|translation:en"
+        RepostHistory(self.repost_history_path).upsert(
+            {
+                "source_key": reverse_key,
+                "source": {
+                    "team_id": "destination-team",
+                    "channel_id": "destination-channel",
+                    "message_id": "destination-parent",
+                },
+                "destination": {
+                    "team_id": "source-team",
+                    "channel_id": "source-channel",
+                    "message_id": "source-parent",
+                },
+                "translation": {"source_language": "zh-Hans", "target_language": "en"},
+            }
+        )
+
+        result = self.service.discover()
+
+        synthetic = self.service.registry.get(synthetic_key)
+        self.assertEqual(result["superseded"], 1)
+        self.assertFalse(synthetic["enabled"])
+        self.assertEqual(synthetic["status"], "superseded")
+        self.assertEqual(synthetic["superseded_by"], reverse_key)
+        self.assertEqual(self.service.registry.get(self.thread_key)["counterpart_thread_key"], reverse_key)
+        with self.assertRaisesRegex(ValueError, "superseded"):
+            self.service.activate(synthetic_key, "backfill_all")
+
+    async def test_return_thread_is_dormant_when_feature_flag_is_disabled(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.service.discover()
+        return_key = self.thread_key + "|reply:return"
+        self.reply_settings.return_enabled = False
+
+        with self.assertRaisesRegex(ValueError, "Reciprocal reply synchronization is disabled"):
+            self.service.activate(return_key, "backfill_all")
+        result = await self.service.run_thread(return_key, FakeReplyGraph())
+        self.assertEqual(result["status"], "return_disabled")
 
     def _write_mapping(self, *, destination_message_id: str | None = "destination-parent", target_language="zh-Hans"):
         RepostHistory(self.repost_history_path).upsert(
@@ -154,12 +373,29 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status"], "completed")
         self.assertEqual(second["sent"], 3)
         bodies = [payload["body"]["content"] for payload in graph.created]
-        self.assertIn("<strong>回覆來源：</strong>", bodies[0])
+        self.assertIn("<strong>原回覆作者：</strong> Author 1", bodies[0])
+        self.assertIn('<a href="https://teams.example/source/1">link</a></p><hr>', bodies[0])
+        self.assertNotIn("回覆來源", bodies[0])
         self.assertIn("https://teams.example/source/1", bodies[0])
         self.assertIn("https://teams.example/source/2", bodies[1])
         self.assertIn("https://teams.example/source/3", bodies[2])
         self.assertNotIn("reply-sync", "".join(bodies))
         self.assertEqual(self.translation_calls, ["1", "2", "3"])
+
+    async def test_english_thread_uses_compact_english_header(self) -> None:
+        graph = FakeReplyGraph([source_reply("1", "2026-07-13T00:00:01Z")])
+        self.service.registry.update(self.thread_key, target_language="en")
+        self.service.activate(self.thread_key, "backfill_all")
+
+        await self.service.run_thread(self.thread_key, graph)
+        result = await self.service.run_thread(self.thread_key, graph)
+
+        self.assertEqual(result["sent"], 1)
+        body = graph.created[0]["body"]["content"]
+        self.assertIn("<strong>Original reply by:</strong> Author 1", body)
+        self.assertIn('<a href="https://teams.example/source/1">link</a></p><hr>', body)
+        self.assertNotIn("原回覆作者", body)
+        self.assertNotIn("Reply source", body)
 
     async def test_identical_timestamps_use_numeric_message_id_order(self) -> None:
         created = "2026-07-13T00:00:01Z"
@@ -256,9 +492,14 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
                 source_reply(
                     "3",
                     "2026-07-13T00:00:03Z",
-                    body="<p><strong>Original reply by:</strong> Legacy author<br>reply-sync-source:old</p>",
+                    body="<p><strong>Original reply by:</strong> Generated author · link</p><hr><p>Body</p>",
                 ),
-                source_reply("4", "2026-07-13T00:00:04Z"),
+                source_reply(
+                    "4",
+                    "2026-07-13T00:00:04Z",
+                    body="<p><strong>原回覆作者：</strong> Generated author · link</p><hr><p>Body</p>",
+                ),
+                source_reply("5", "2026-07-13T00:00:05Z"),
             ]
         )
         self.service.activate(self.thread_key, "backfill_all")
@@ -267,8 +508,67 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.run_thread(self.thread_key, graph)
 
         self.assertEqual(result["sent"], 1)
-        self.assertEqual(self.translation_calls, ["4"])
-        self.assertIn("https://teams.example/source/4", graph.created[0]["body"]["content"])
+        self.assertEqual(self.translation_calls, ["5"])
+        self.assertIn("https://teams.example/source/5", graph.created[0]["body"]["content"])
+
+    async def test_paired_threads_sync_human_replies_both_ways_without_ping_pong(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.reply_settings.stability_scans = 1
+        self.service.discover()
+        return_key = self.thread_key + "|reply:return"
+        self.service.activate(self.thread_key, "backfill_all")
+        self.service.activate(return_key, "backfill_all")
+        graph = PairedReplyGraph(
+            {
+                "source-parent": [source_reply("original-human", "2026-07-13T00:00:01Z")],
+                "destination-parent": [
+                    source_reply(
+                        "translated-human",
+                        "2026-07-13T00:00:02Z",
+                        body="<p>Translated-side human reply</p>",
+                    )
+                ],
+            }
+        )
+
+        primary_result = await self.service.run_thread(self.thread_key, graph)
+        return_result = await self.service.run_thread(return_key, graph)
+        primary_repeat = await self.service.run_thread(self.thread_key, graph)
+        return_repeat = await self.service.run_thread(return_key, graph)
+
+        self.assertEqual(primary_result["sent"], 1)
+        self.assertEqual(return_result["sent"], 1)
+        self.assertEqual(primary_repeat["sent"], 0)
+        self.assertEqual(return_repeat["sent"], 0)
+        self.assertEqual([parent for parent, _ in graph.created_with_parent], ["destination-parent", "source-parent"])
+        self.assertIn("<strong>Original reply by:</strong>", graph.created[1]["body"]["content"])
+        self.assertEqual(self.translation_calls, ["original-human", "translated-human"])
+        self.assertEqual(len(graph.created), 2)
+
+    async def test_return_failure_does_not_pause_primary_thread(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.reply_settings.stability_scans = 1
+        self.service.discover()
+        return_key = self.thread_key + "|reply:return"
+        self.service.activate(self.thread_key, "backfill_all")
+        self.service.activate(return_key, "backfill_all")
+        graph = FakeReplyGraph()
+        graph.destination_replies.append(
+            source_reply(
+                "translated-human",
+                "2026-07-13T00:00:02Z",
+                body="<p>Translated-side human reply</p>",
+            )
+        )
+        graph.fail_create = True
+
+        result = await self.service.run_thread(return_key, graph)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blocked_reply_id"], "translated-human")
+        primary = self.service.registry.get(self.thread_key)
+        self.assertTrue(primary["enabled"])
+        self.assertEqual(primary["status"], "active")
 
     async def test_late_earlier_reply_pauses_with_sequence_conflict(self) -> None:
         graph = FakeReplyGraph([source_reply("2", "2026-07-13T00:00:02Z")])
@@ -321,6 +621,7 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.service.discover()
+        self.reply_settings.return_enabled = True
         graph = FakeReplyGraph()
         linked = await self.service.link_destination(
             other_key,
@@ -333,24 +634,42 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
             "source-team", "source-channel", "manual-parent", "zh-Hans"
         )
         self.assertIsNone(main_record["destination"]["message_id"])
+        reciprocal = self.service.registry.get(other_key + "|reply:return")
+        self.assertEqual(reciprocal["source"]["message_id"], "destination-manual")
+        self.assertEqual(reciprocal["destination"]["message_id"], "manual-parent")
+        self.assertFalse(reciprocal["enabled"])
 
 
 class PayloadTests(unittest.TestCase):
-    def test_english_reply_uses_reply_source_label_without_sync_language(self) -> None:
+    def test_explicit_english_target_uses_compact_english_header(self) -> None:
         reply = {
             "id": "1",
             "author": "Alex",
             "web_url": "https://teams.example/source/1",
-            "target_language": "en",
+            "target_language": "zh-Hans",
             "body_html": "<p>Hello</p>",
             "attachments": [],
         }
 
-        payload, _ = build_reply_payload(reply, {"body_html": "<p>Hello</p>"}, {})
+        payload, _ = build_reply_payload(reply, {"body_html": "<p>Hello</p>"}, {}, target_language="en")
 
-        self.assertIn("<strong>Reply source:</strong>", payload["body"]["content"])
         self.assertIn("<strong>Original reply by:</strong> Alex", payload["body"]["content"])
+        self.assertIn('<a href="https://teams.example/source/1">link</a></p><hr>', payload["body"]["content"])
+        self.assertNotIn("原回覆作者", payload["body"]["content"])
+        self.assertNotIn("Reply source", payload["body"]["content"])
         self.assertNotIn("reply-sync", payload["body"]["content"])
+
+    def test_missing_target_language_does_not_fall_back_to_chinese_header(self) -> None:
+        reply = {
+            "id": "1",
+            "author": "Alex",
+            "web_url": "https://teams.example/source/1",
+            "body_html": "<p>Hello</p>",
+            "attachments": [],
+        }
+
+        with self.assertRaisesRegex(ReplyFidelityError, "target language is missing"):
+            build_reply_payload(reply, {"body_html": "<p>Hello</p>"}, {})
 
     def test_builds_reply_with_hosted_image_and_reference_attachment(self) -> None:
         reply = {
@@ -368,8 +687,10 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(len(payload["hostedContents"]), 1)
         self.assertEqual(len(payload["attachments"]), 1)
         self.assertIn('../hostedContents/1/$value', payload["body"]["content"])
-        self.assertIn("<strong>回覆來源：</strong>", payload["body"]["content"])
-        self.assertIn("https://teams.example/source/1", payload["body"]["content"])
+        self.assertIn("<strong>原回覆作者：</strong> Alex", payload["body"]["content"])
+        self.assertIn('<a href="https://teams.example/source/1">link</a></p><hr>', payload["body"]["content"])
+        self.assertNotIn("Original reply by", payload["body"]["content"])
+        self.assertNotIn("回覆來源", payload["body"]["content"])
         self.assertNotIn("reply-sync", payload["body"]["content"])
         self.assertFalse(fidelity["degraded"])
 
@@ -386,6 +707,7 @@ class PayloadTests(unittest.TestCase):
         reply = {
             "id": "1",
             "web_url": "https://teams.example/source/1",
+            "target_language": "zh-Hans",
             "body_html": '<p><img src="../hostedContents/image-1/$value"></p>',
             "attachments": [{"name": "file", "content_type": "card", "content_url": None}],
         }
@@ -460,6 +782,8 @@ class ReplySyncConfigTests(unittest.TestCase):
     def test_defaults_are_disabled_and_isolated(self) -> None:
         settings = ReplySyncSettings(_env_file=None)
         self.assertFalse(settings.enabled)
+        self.assertFalse(settings.return_enabled)
+        self.assertFalse(settings.return_auto_enroll_new_threads)
         self.assertEqual(settings.registry_path, Path(".data/reply-sync/thread-registry.json"))
         self.assertEqual(settings.flow_list, ["forward", "reverse"])
 
