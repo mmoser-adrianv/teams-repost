@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ from reply_sync.payloads import ReplyFidelityError, build_degraded_reply_payload
 import reply_sync.router as reply_router_module
 import reply_sync.worker as reply_worker_module
 from reply_sync.service import ReplySyncService
-from reply_sync.stores import ReplyCache, ThreadRegistry
+from reply_sync.stores import ReplyCache, ReturnQueue, ThreadRegistry
 
 
 def source_reply(
@@ -120,6 +121,7 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.reply_settings.registry_path = root / "reply-sync" / "registry.json"
         self.reply_settings.cache_path = root / "reply-sync" / "cache.json"
         self.reply_settings.history_path = root / "reply-sync" / "history.json"
+        self.reply_settings.return_queue_path = root / "reply-sync" / "return-queue.json"
         self.reply_settings.lock_path = root / "reply-sync" / "lock"
         self.reply_settings.temp_folder = root / "reply-sync" / "temp"
         self.reply_settings.stability_scans = 2
@@ -230,6 +232,21 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(newly_created["enabled"])
         self.assertEqual(newly_created["start_mode"], "backfill_all")
         self.assertEqual(newly_created["status"], "active")
+
+    def test_controlled_backfill_activates_existing_return_previews(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.service.discover()
+        return_key = self.thread_key + "|reply:return"
+        self.assertFalse(self.service.registry.get(return_key)["enabled"])
+
+        self.reply_settings.return_backfill_existing_threads = True
+        result = self.service.discover()
+
+        reciprocal = self.service.registry.get(return_key)
+        self.assertGreaterEqual(result["updated"], 1)
+        self.assertTrue(reciprocal["enabled"])
+        self.assertEqual(reciprocal["start_mode"], "backfill_all")
+        self.assertEqual(reciprocal["status"], "active")
 
     def test_reverse_mapping_gets_a_chinese_return_thread(self) -> None:
         reverse_key = "destination-team|destination-channel|reverse-source|translation:en"
@@ -545,6 +562,112 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.translation_calls, ["original-human", "translated-human"])
         self.assertEqual(len(graph.created), 2)
 
+    async def test_return_backlog_is_pretranslated_but_dispatched_one_per_interval(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.reply_settings.stability_scans = 1
+        self.reply_settings.return_send_interval_minutes = 10
+        self.service.discover()
+        return_key = self.thread_key + "|reply:return"
+        self.service.activate(return_key, "backfill_all")
+        graph = PairedReplyGraph(
+            {
+                "source-parent": [],
+                "destination-parent": [
+                    source_reply("return-1", "2026-07-13T00:00:01Z"),
+                    source_reply("return-2", "2026-07-13T00:00:02Z"),
+                    source_reply("return-3", "2026-07-13T00:00:03Z"),
+                ],
+            }
+        )
+
+        first = await self.service.run_thread(return_key, graph)
+        immediate = await self.service.run_thread(return_key, graph)
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(first["dispatch_status"], "sent")
+        self.assertEqual(immediate["sent"], 0)
+        self.assertEqual(immediate["dispatch_status"], "throttled")
+        self.assertEqual(self.translation_calls, ["return-1", "return-2", "return-3"])
+        self.assertEqual(len(graph.created), 1)
+        self.assertEqual(self.service.return_queue.summary()["counts"]["ready"], 2)
+
+        self.service.return_queue.record_send((datetime.now(UTC) - timedelta(minutes=11)).isoformat())
+        second = await self.service.run_thread(return_key, graph)
+        self.service.return_queue.record_send((datetime.now(UTC) - timedelta(minutes=11)).isoformat())
+        third = await self.service.run_thread(return_key, graph)
+
+        self.assertEqual(second["sent"], 1)
+        self.assertEqual(third["sent"], 1)
+        self.assertEqual([parent for parent, _ in graph.created_with_parent], ["source-parent"] * 3)
+        bodies = [payload["body"]["content"] for payload in graph.created]
+        self.assertIn("/return-1", bodies[0])
+        self.assertIn("/return-2", bodies[1])
+        self.assertIn("/return-3", bodies[2])
+
+    async def test_return_throttle_survives_service_recreation(self) -> None:
+        self.reply_settings.return_enabled = True
+        self.reply_settings.stability_scans = 1
+        self.service.discover()
+        return_key = self.thread_key + "|reply:return"
+        self.service.activate(return_key, "backfill_all")
+        graph = PairedReplyGraph(
+            {
+                "source-parent": [],
+                "destination-parent": [
+                    source_reply("return-1", "2026-07-13T00:00:01Z"),
+                    source_reply("return-2", "2026-07-13T00:00:02Z"),
+                ],
+            }
+        )
+        await self.service.run_thread(return_key, graph)
+
+        restarted = ReplySyncService(self.reply_settings, self.core_settings, self.translate)
+        result = await restarted.run_thread(return_key, graph)
+
+        self.assertEqual(result["dispatch_status"], "throttled")
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(len(graph.created), 1)
+
+    async def test_run_all_collects_multiple_return_threads_but_sends_only_one(self) -> None:
+        second_key = "source-team|source-channel|source-parent-2|translation:zh-Hans"
+        RepostHistory(self.repost_history_path).upsert(
+            {
+                "source_key": second_key,
+                "source": {
+                    "team_id": "source-team",
+                    "channel_id": "source-channel",
+                    "message_id": "source-parent-2",
+                },
+                "destination": {
+                    "team_id": "destination-team",
+                    "channel_id": "destination-channel",
+                    "message_id": "destination-parent-2",
+                },
+                "translation": {"source_language": "en", "target_language": "zh-Hans"},
+            }
+        )
+        self.reply_settings.return_enabled = True
+        self.reply_settings.return_backfill_existing_threads = True
+        self.reply_settings.stability_scans = 1
+        graph = PairedReplyGraph(
+            {
+                "source-parent": [],
+                "source-parent-2": [],
+                "destination-parent": [source_reply("return-1", "2026-07-13T00:00:01Z")],
+                "destination-parent-2": [source_reply("return-2", "2026-07-13T00:00:02Z")],
+            }
+        )
+
+        first = await self.service.run_all(graph)
+        immediate = await self.service.run_all(graph)
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(immediate["sent"], 0)
+        self.assertEqual(sorted(self.translation_calls), ["return-1", "return-2"])
+        self.assertEqual(len(graph.created), 1)
+        self.assertIn("/return-1", graph.created[0]["body"]["content"])
+        self.assertEqual(self.service.return_queue.summary()["counts"]["ready"], 1)
+
     async def test_return_failure_does_not_pause_primary_thread(self) -> None:
         self.reply_settings.return_enabled = True
         self.reply_settings.stability_scans = 1
@@ -719,6 +842,42 @@ class PayloadTests(unittest.TestCase):
 
 
 class StoreAndGraphTests(unittest.IsolatedAsyncioTestCase):
+    async def test_return_queue_preserves_per_thread_heads_and_send_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            queue = ReturnQueue(Path(folder) / "return-queue.json")
+            queue.upsert_many(
+                [
+                    {
+                        "thread_key": "thread-a",
+                        "source_reply_id": "a-2",
+                        "source_created_date_time": "2026-07-13T00:00:01Z",
+                        "sequence": 1,
+                        "status": "ready",
+                    },
+                    {
+                        "thread_key": "thread-a",
+                        "source_reply_id": "a-1",
+                        "source_created_date_time": "2026-07-13T00:00:02Z",
+                        "sequence": 0,
+                        "status": "blocked",
+                    },
+                    {
+                        "thread_key": "thread-b",
+                        "source_reply_id": "b-1",
+                        "source_created_date_time": "2026-07-13T00:00:03Z",
+                        "sequence": 0,
+                        "status": "ready",
+                    },
+                ]
+            )
+
+            heads = queue.ready_heads()
+            sent_at = queue.record_send("2026-07-13T00:10:00+00:00")
+
+            self.assertEqual([item["source_reply_id"] for item in heads], ["b-1"])
+            self.assertEqual(sent_at, "2026-07-13T00:10:00+00:00")
+            self.assertEqual(ReturnQueue(Path(folder) / "return-queue.json").last_sent_at(), sent_at)
+
     async def test_reply_graph_follows_all_pages(self) -> None:
         class FakeClient:
             def __init__(self):
@@ -784,6 +943,9 @@ class ReplySyncConfigTests(unittest.TestCase):
         self.assertFalse(settings.enabled)
         self.assertFalse(settings.return_enabled)
         self.assertFalse(settings.return_auto_enroll_new_threads)
+        self.assertFalse(settings.return_backfill_existing_threads)
+        self.assertEqual(settings.return_send_interval_minutes, 10)
+        self.assertEqual(settings.return_queue_path, Path(".data/reply-sync/return-queue.json"))
         self.assertEqual(settings.registry_path, Path(".data/reply-sync/thread-registry.json"))
         self.assertEqual(settings.flow_list, ["forward", "reverse"])
 
@@ -821,6 +983,7 @@ class ReplySyncRouterTests(unittest.TestCase):
         self.reply_settings.registry_path = root / "registry.json"
         self.reply_settings.cache_path = root / "cache.json"
         self.reply_settings.history_path = root / "history.json"
+        self.reply_settings.return_queue_path = root / "return-queue.json"
         self.reply_settings.lock_path = root / "lock"
         self.reply_settings.temp_folder = root / "temp"
         self.core_settings = SimpleNamespace(

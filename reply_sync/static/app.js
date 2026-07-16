@@ -1,10 +1,19 @@
-const state = { signedIn: false, enabled: false, returnEnabled: false, threads: [] };
+const state = {
+  signedIn: false,
+  enabled: false,
+  returnEnabled: false,
+  returnQueue: {},
+  returnIntervalMinutes: 10,
+  returnNextSendAt: null,
+  threads: [],
+};
 
 const authStatus = document.querySelector("#authStatus");
 const loginLink = document.querySelector("#loginLink");
 const discoverButton = document.querySelector("#discoverButton");
 const refreshButton = document.querySelector("#refreshButton");
 const threadCount = document.querySelector("#threadCount");
+const returnQueueStatus = document.querySelector("#returnQueueStatus");
 const threadsNode = document.querySelector("#threads");
 const template = document.querySelector("#threadTemplate");
 const messageNode = document.querySelector("#message");
@@ -34,6 +43,9 @@ async function loadThreads() {
   const payload = await api("/api/reply-sync/threads");
   state.enabled = payload.enabled;
   state.returnEnabled = payload.return_enabled;
+  state.returnQueue = payload.return_queue || {};
+  state.returnIntervalMinutes = payload.return_send_interval_minutes || 10;
+  state.returnNextSendAt = payload.return_next_send_at;
   state.threads = payload.threads || [];
   automationBanner.classList.toggle("hidden", state.enabled);
   if (state.enabled) {
@@ -48,6 +60,11 @@ async function loadThreads() {
 function render() {
   threadsNode.replaceChildren();
   threadCount.textContent = `${state.threads.length} thread${state.threads.length === 1 ? "" : "s"}`;
+  const counts = state.returnQueue.counts || {};
+  const completed = (counts.sent || 0) + (counts.degraded || 0) + (counts.recovered || 0) + (counts.skipped_deleted || 0);
+  const pending = Math.max(0, (state.returnQueue.total || 0) - completed);
+  returnQueueStatus.textContent = ` · Return backlog: ${pending} pending, ${counts.ready || 0} translated · one send every ${state.returnIntervalMinutes} minutes`;
+  returnQueueStatus.classList.toggle("hidden", !state.returnEnabled);
   for (const thread of state.threads) threadsNode.append(renderThread(thread));
 }
 
@@ -62,6 +79,7 @@ function renderThread(thread) {
   for (const [label, value] of [
     ["Replies found", thread.discovered_reply_count],
     ["Queued", thread.queued_reply_count],
+    ...(direction === "return" ? [["Return backlog", thread.return_queue_count], ["Translated", thread.return_ready_count]] : []),
     ["Completed", thread.completed_reply_count],
     ["Stable scans", thread.stable_scans],
     ["Last sequence", thread.last_contiguous_sequence],

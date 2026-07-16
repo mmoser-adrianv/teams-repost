@@ -21,6 +21,16 @@ class ReplySyncSettings(BaseSettings):
         default=False,
         alias="REPLY_SYNC_RETURN_AUTO_ENROLL_NEW_THREADS",
     )
+    return_backfill_existing_threads: bool = Field(
+        default=False,
+        alias="REPLY_SYNC_RETURN_BACKFILL_EXISTING_THREADS",
+    )
+    return_send_interval_minutes: int = Field(
+        default=10,
+        alias="REPLY_SYNC_RETURN_SEND_INTERVAL_MINUTES",
+        ge=1,
+        le=1440,
+    )
     stability_scans: int = Field(default=2, alias="REPLY_SYNC_STABILITY_SCANS", ge=1, le=10)
     max_replies_per_run: int = Field(default=50, alias="REPLY_SYNC_MAX_REPLIES_PER_RUN", ge=1, le=500)
     registry_path: Path = Field(
@@ -34,6 +44,10 @@ class ReplySyncSettings(BaseSettings):
     history_path: Path = Field(
         default=Path(".data/reply-sync/reply-history.json"),
         alias="REPLY_SYNC_HISTORY_PATH",
+    )
+    return_queue_path: Path = Field(
+        default=Path(".data/reply-sync/return-queue.json"),
+        alias="REPLY_SYNC_RETURN_QUEUE_PATH",
     )
     lock_path: Path = Field(
         default=Path(".data/reply-sync/automation.lock"),
@@ -79,6 +93,7 @@ def get_reply_sync_settings() -> ReplySyncSettings:
     settings.registry_path = _resolved(settings.registry_path)
     settings.cache_path = _resolved(settings.cache_path)
     settings.history_path = _resolved(settings.history_path)
+    settings.return_queue_path = _resolved(settings.return_queue_path)
     settings.lock_path = _resolved(settings.lock_path)
     settings.temp_folder = _resolved(settings.temp_folder)
     return settings

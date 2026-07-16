@@ -265,6 +265,125 @@ class ReplyCache:
         return data
 
 
+class ReturnQueue:
+    TERMINAL_STATUSES = {"sent", "degraded", "recovered", "skipped_deleted"}
+
+    def __init__(self, path: Path) -> None:
+        self.store = AtomicJsonStore(path, {"version": 1, "last_sent_at": None, "items": {}})
+
+    def list_items(self, thread_key: str | None = None) -> list[dict[str, Any]]:
+        items = self._load()["items"].values()
+        if thread_key is not None:
+            items = [item for item in items if item.get("thread_key") == thread_key]
+        return sorted(
+            (deepcopy(item) for item in items),
+            key=lambda item: (
+                str(item.get("source_created_date_time") or ""),
+                str(item.get("thread_key") or ""),
+                int(item.get("sequence") or 0),
+                str(item.get("source_reply_id") or ""),
+            ),
+        )
+
+    def get(self, thread_key: str, source_reply_id: str) -> dict[str, Any] | None:
+        item = self._load()["items"].get(_return_queue_key(thread_key, source_reply_id))
+        return deepcopy(item) if item else None
+
+    def upsert_many(self, items: list[dict[str, Any]]) -> int:
+        if not items:
+            return 0
+        data = self._load()
+        records = data["items"]
+        now = utc_now()
+        changed = 0
+        for item in items:
+            thread_key = str(item["thread_key"])
+            source_reply_id = str(item["source_reply_id"])
+            key = _return_queue_key(thread_key, source_reply_id)
+            existing = records.get(key) or {}
+            if existing.get("status") in self.TERMINAL_STATUSES:
+                continue
+            record = {
+                **deepcopy(existing),
+                **deepcopy(item),
+                "queue_key": key,
+                "thread_key": thread_key,
+                "source_reply_id": source_reply_id,
+                "queued_at": existing.get("queued_at") or now,
+                "updated_at": now,
+            }
+            if existing != record:
+                records[key] = record
+                changed += 1
+        if changed:
+            self.store.save(data)
+        return changed
+
+    def mark(self, thread_key: str, source_reply_id: str, status: str, **changes: Any) -> dict[str, Any] | None:
+        data = self._load()
+        key = _return_queue_key(thread_key, source_reply_id)
+        item = data["items"].get(key)
+        if not item:
+            return None
+        item.update(deepcopy(changes))
+        item["status"] = status
+        item["updated_at"] = utc_now()
+        self.store.save(data)
+        return deepcopy(item)
+
+    def ready_heads(self) -> list[dict[str, Any]]:
+        pending_by_thread: dict[str, dict[str, Any]] = {}
+        for item in self.list_items():
+            if item.get("status") in self.TERMINAL_STATUSES:
+                continue
+            thread_key = str(item.get("thread_key") or "")
+            current = pending_by_thread.get(thread_key)
+            if current is None or int(item.get("sequence") or 0) < int(current.get("sequence") or 0):
+                pending_by_thread[thread_key] = item
+        return sorted(
+            (item for item in pending_by_thread.values() if item.get("status") == "ready"),
+            key=lambda item: (
+                str(item.get("source_created_date_time") or ""),
+                str(item.get("thread_key") or ""),
+                int(item.get("sequence") or 0),
+                str(item.get("source_reply_id") or ""),
+            ),
+        )
+
+    def last_sent_at(self) -> str | None:
+        value = self._load().get("last_sent_at")
+        return str(value) if value else None
+
+    def record_send(self, sent_at: str | None = None) -> str:
+        data = self._load()
+        value = sent_at or utc_now()
+        data["last_sent_at"] = value
+        self.store.save(data)
+        return value
+
+    def summary(self) -> dict[str, Any]:
+        data = self._load()
+        counts: dict[str, int] = {}
+        for item in data["items"].values():
+            status = str(item.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        return {
+            "last_sent_at": data.get("last_sent_at"),
+            "total": len(data["items"]),
+            "counts": counts,
+        }
+
+    def _load(self) -> dict[str, Any]:
+        data = self.store.load()
+        if data.get("version") != 1:
+            raise ValueError(f"Unsupported return-queue version: {data.get('version')}")
+        items = data.setdefault("items", {})
+        if not isinstance(items, dict):
+            raise ValueError("Reply-sync return queue items must be an object")
+        data.setdefault("last_sent_at", None)
+        return data
+
+
 class ReplyHistory:
     def __init__(self, path: Path) -> None:
         self.store = AtomicJsonStore(path, {"version": 1, "records": []})
@@ -326,3 +445,7 @@ def _thread_key(source: dict[str, Any], target_language: str) -> str:
 
 def _is_completed_history_record(record: dict[str, Any]) -> bool:
     return record.get("status") in {"sent", "degraded", "recovered"}
+
+
+def _return_queue_key(thread_key: str, source_reply_id: str) -> str:
+    return f"{thread_key}|source-reply:{source_reply_id}"

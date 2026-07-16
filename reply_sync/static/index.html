@@ -23,7 +23,10 @@
       <div id="automationBanner" class="banner hidden"></div>
       <div id="message" class="banner hidden" role="status"></div>
       <section class="summary">
-        <span id="threadCount">0 threads</span>
+        <div>
+          <span id="threadCount">0 threads</span>
+          <span id="returnQueueStatus" class="status hidden"></span>
+        </div>
         <button id="refreshButton" class="button secondary" type="button">Refresh status</button>
       </section>
       <section id="threads" class="thread-list" aria-live="polite"></section>
@@ -43,6 +46,6 @@
         <div class="actions"></div>
       </article>
     </template>
-    <script src="/reply-sync/app.js?v=2"></script>
+    <script src="/reply-sync/app.js?v=3"></script>
   </body>
 </html>
