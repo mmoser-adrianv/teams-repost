@@ -57,7 +57,7 @@ class ReplySyncService:
         self.registry = ThreadRegistry(reply_settings.registry_path)
         self.cache = ReplyCache(reply_settings.cache_path)
         self.history = ReplyHistory(reply_settings.history_path)
-        self.return_queue = ReturnQueue(reply_settings.return_queue_path)
+        self.return_queue = ReturnQueue(reply_settings.queue_path)
 
     def discover(self) -> dict[str, int]:
         records = RepostHistory(self.core_settings.repost_history_path).list_records()
@@ -73,9 +73,9 @@ class ReplySyncService:
 
     def list_threads(self) -> dict[str, Any]:
         threads = []
-        return_items_by_thread: dict[str, list[dict[str, Any]]] = {}
+        queue_items_by_thread: dict[str, list[dict[str, Any]]] = {}
         for item in self.return_queue.list_items():
-            return_items_by_thread.setdefault(str(item.get("thread_key") or ""), []).append(item)
+            queue_items_by_thread.setdefault(str(item.get("thread_key") or ""), []).append(item)
         for thread in self.registry.list_threads():
             cache = self.cache.get_thread(thread["thread_key"])
             records = self.history.list_records(thread["thread_key"])
@@ -84,28 +84,36 @@ class ReplySyncService:
             ordered = cache.get("ordered_reply_ids") or []
             queued = [reply_id for reply_id in ordered if reply_id not in completed and reply_id not in baseline]
             summary = deepcopy(thread)
-            return_items = return_items_by_thread.get(thread["thread_key"], [])
+            queue_items = queue_items_by_thread.get(thread["thread_key"], [])
+            queue_count = sum(
+                1 for item in queue_items if item.get("status") not in ReturnQueue.TERMINAL_STATUSES
+            )
+            ready_count = sum(1 for item in queue_items if item.get("status") == "ready")
             summary.update(
                 {
                     "discovered_reply_count": len(ordered),
                     "queued_reply_count": len(queued),
                     "completed_reply_count": len(completed),
                     "stable_scans": int(cache.get("stable_scans") or 0),
-                    "return_queue_count": sum(
-                        1 for item in return_items if item.get("status") not in ReturnQueue.TERMINAL_STATUSES
-                    ),
-                    "return_ready_count": sum(1 for item in return_items if item.get("status") == "ready"),
+                    "reply_queue_count": queue_count,
+                    "reply_ready_count": ready_count,
+                    "return_queue_count": queue_count,
+                    "return_ready_count": ready_count,
                     "automation_enabled": self.reply_settings.enabled and self._direction_enabled(thread),
                 }
             )
             threads.append(summary)
-        return_next_send_at = self._return_next_send_at()
+        next_send_at = self._next_send_at()
+        queue_summary = self.return_queue.summary()
         return {
             "enabled": self.reply_settings.enabled,
             "return_enabled": self.reply_settings.return_enabled,
-            "return_send_interval_minutes": self.reply_settings.return_send_interval_minutes,
-            "return_next_send_at": return_next_send_at.isoformat() if return_next_send_at else None,
-            "return_queue": self.return_queue.summary(),
+            "send_interval_minutes": self.reply_settings.send_interval_minutes,
+            "next_send_at": next_send_at.isoformat() if next_send_at else None,
+            "reply_queue": queue_summary,
+            "return_send_interval_minutes": self.reply_settings.send_interval_minutes,
+            "return_next_send_at": next_send_at.isoformat() if next_send_at else None,
+            "return_queue": queue_summary,
             "threads": threads,
         }
 
@@ -182,24 +190,13 @@ class ReplySyncService:
 
     async def run_all(self, graph: ReplyGraph) -> dict[str, Any]:
         discovery = self.discover()
-        remaining = self.reply_settings.max_replies_per_run
         results: list[dict[str, Any]] = []
         threads = self.registry.list_threads()
         for thread in threads:
-            if thread.get("direction", "primary") == "return":
+            if not self._direction_enabled(thread) or not thread.get("enabled"):
                 continue
-            if not self._direction_enabled(thread) or not thread.get("enabled") or remaining <= 0:
-                continue
-            result = await self._run_immediate_thread(thread["thread_key"], graph, remaining)
-            remaining -= int(result.get("sent") or 0) + int(result.get("recovered") or 0)
-            results.append(result)
-
-        if self.reply_settings.return_enabled:
-            for thread in threads:
-                if thread.get("direction") != "return" or not thread.get("enabled"):
-                    continue
-                results.append(await self._collect_return_thread(thread["thread_key"], graph))
-            results.append(await self._dispatch_return_reply(graph))
+            results.append(await self._collect_thread(thread["thread_key"], graph))
+        results.append(await self._dispatch_reply(graph))
         return {
             "status": "completed",
             "discovery": discovery,
@@ -209,14 +206,11 @@ class ReplySyncService:
             "blocked": sum(1 for result in results if result.get("status") == "blocked"),
         }
 
-    async def run_thread(self, thread_key: str, graph: ReplyGraph, limit: int | None = None) -> dict[str, Any]:
-        thread = self._thread(thread_key)
-        if thread.get("direction") != "return":
-            return await self._run_immediate_thread(thread_key, graph, limit)
-        collection = await self._collect_return_thread(thread_key, graph)
+    async def run_thread(self, thread_key: str, graph: ReplyGraph) -> dict[str, Any]:
+        collection = await self._collect_thread(thread_key, graph)
         if collection.get("status") in {"paused", "return_disabled", "superseded", "sequence_conflict"}:
             return collection
-        dispatch = await self._dispatch_return_reply(graph)
+        dispatch = await self._dispatch_reply(graph)
         return {
             **collection,
             "status": "blocked" if dispatch.get("status") == "blocked" else collection.get("status"),
@@ -228,12 +222,7 @@ class ReplySyncService:
             "error": dispatch.get("error") or collection.get("error"),
         }
 
-    async def _run_immediate_thread(
-        self,
-        thread_key: str,
-        graph: ReplyGraph,
-        limit: int | None = None,
-    ) -> dict[str, Any]:
+    async def _collect_thread(self, thread_key: str, graph: ReplyGraph) -> dict[str, Any]:
         thread = self._thread(thread_key)
         if thread.get("status") == "superseded":
             return {"thread_key": thread_key, "status": "superseded", "sent": 0, "recovered": 0}
@@ -278,133 +267,10 @@ class ReplySyncService:
                 baseline_pending=False,
             )
             return {"thread_key": thread_key, "status": "baselined", "sent": 0, "recovered": 0}
-        sent = 0
-        recovered = 0
-        max_items = limit if limit is not None else self.reply_settings.max_replies_per_run
-        destination_replies: list[dict[str, Any]] | None = None
-        baseline = set(thread.get("baseline_reply_ids") or [])
-        ordered_ids = thread_cache.get("ordered_reply_ids") or []
-        for sequence, reply_id in enumerate(ordered_ids):
-            if sent + recovered >= max_items:
-                break
-            if reply_id in baseline or self.history.get(thread_key, reply_id):
-                continue
-            reply = thread_cache["replies"][reply_id]
-            if int(reply.get("observed_scans") or 0) < self.reply_settings.stability_scans:
-                return {
-                    "thread_key": thread_key,
-                    "status": "stabilizing",
-                    "stable_scans": reply.get("observed_scans"),
-                    "sent": sent,
-                    "recovered": recovered,
-                }
-            if reply.get("deleted_date_time"):
-                self._record_completion(thread, reply, sequence, None, "skipped_deleted", {})
-                continue
-            try:
-                translation = reply.get("translation")
-                if not translation:
-                    translation = await self.translator(reply, thread["target_language"], self.core_settings)
-                    self.cache.save_translation(thread_key, reply_id, translation)
-                    reply["translation"] = translation
-
-                if destination_replies is None:
-                    destination_replies = await graph.list_replies(
-                        destination["team_id"], destination["channel_id"], destination["message_id"]
-                    )
-                matches = _find_destination_matches(destination_replies, reply)
-                if len(matches) > 1:
-                    raise ReplySequenceConflict(f"Multiple destination replies match source reply {reply_id}")
-                if len(matches) == 1:
-                    self._record_completion(thread, reply, sequence, matches[0], "recovered", {"degraded": False})
-                    recovered += 1
-                    continue
-
-                hosted = await self._download_hosted_contents(graph, thread, reply)
-                payload, fidelity = build_reply_payload(
-                    reply,
-                    translation,
-                    hosted,
-                    target_language=thread["target_language"],
-                )
-                created = await graph.create_reply(
-                    destination["team_id"], destination["channel_id"], destination["message_id"], payload
-                )
-                self._record_completion(thread, reply, sequence, created, "sent", fidelity)
-                destination_replies.append(created)
-                sent += 1
-            except ReplySequenceConflict as exc:
-                self.registry.update(thread_key, enabled=False, status="sequence_conflict", error=str(exc))
-                return {
-                    "thread_key": thread_key,
-                    "status": "sequence_conflict",
-                    "sent": sent,
-                    "recovered": recovered,
-                    "error": str(exc),
-                }
-            except (GraphAPIError, TranslationError, ReplyFidelityError, ValueError) as exc:
-                return self._block(thread_key, reply_id, str(exc), sent, recovered)
-
-        self.registry.update(thread_key, status="active", blocked_reply_id=None, error=None)
-        return {"thread_key": thread_key, "status": "completed", "sent": sent, "recovered": recovered}
-
-    async def _collect_return_thread(self, thread_key: str, graph: ReplyGraph) -> dict[str, Any]:
-        thread = self._thread(thread_key)
-        if thread.get("status") == "superseded":
-            return {"thread_key": thread_key, "status": "superseded", "sent": 0, "recovered": 0}
-        if not self._direction_enabled(thread):
-            return {"thread_key": thread_key, "status": "return_disabled", "sent": 0, "recovered": 0}
-        if not thread.get("enabled"):
-            return {"thread_key": thread_key, "status": "paused", "sent": 0, "recovered": 0}
-        destination = thread.get("destination") or {}
-        if not destination.get("message_id"):
-            return self._block(thread_key, None, "Destination post is not linked")
-
-        source = thread["source"]
-        counterpart_thread_key = thread.get("counterpart_thread_key")
-        paired_destination_ids = (
-            self.history.destination_reply_ids(str(counterpart_thread_key)) if counterpart_thread_key else set()
-        )
-        try:
-            listed = await graph.list_replies(source["team_id"], source["channel_id"], source["message_id"])
-            normalized = sorted(
-                (
-                    _normalize_reply(reply, thread["target_language"])
-                    for reply in listed
-                    if _is_user_reply(reply) and not _is_translated_reply(reply, paired_destination_ids)
-                ),
-                key=_reply_sort_key,
-            )
-            thread_cache = self.cache.record_scan(thread_key, normalized)
-            self.registry.update(thread_key, last_scan_at=thread_cache["last_scan_at"])
-            self._record_drift(thread_key, thread_cache)
-            self._assert_no_late_reply(thread, thread_cache)
-        except (GraphAPIError, ValueError, ReplySequenceConflict) as exc:
-            if isinstance(exc, ReplySequenceConflict):
-                self.registry.update(thread_key, enabled=False, status="sequence_conflict", error=str(exc))
-                return {
-                    "thread_key": thread_key,
-                    "status": "sequence_conflict",
-                    "sent": 0,
-                    "recovered": 0,
-                    "error": str(exc),
-                }
-            return self._block(thread_key, None, str(exc))
-
-        thread = self._thread(thread_key)
-        if thread.get("baseline_pending"):
-            self.registry.update(
-                thread_key,
-                baseline_reply_ids=list(thread_cache["ordered_reply_ids"]),
-                baseline_pending=False,
-            )
-            return {"thread_key": thread_key, "status": "baselined", "sent": 0, "recovered": 0}
-
         baseline = set(thread.get("baseline_reply_ids") or [])
         ordered_ids = thread_cache.get("ordered_reply_ids") or []
         queue_items: list[dict[str, Any]] = []
         collected = 0
-        translated = 0
         for sequence, reply_id in enumerate(ordered_ids):
             if reply_id in baseline:
                 continue
@@ -419,15 +285,19 @@ class ReplySyncService:
                     )
                 continue
             reply = thread_cache["replies"][reply_id]
+            translation = reply.get("translation")
             queue_item = {
                 "thread_key": thread_key,
                 "mapping_key": thread.get("mapping_key") or thread_key,
+                "direction": thread.get("direction", "primary"),
                 "source_reply_id": reply_id,
                 "source_created_date_time": reply.get("created_date_time"),
                 "source_etag": reply.get("etag"),
                 "sequence": sequence,
-                "status": "collected",
+                "status": "ready" if translation else "collected",
             }
+            if translation:
+                queue_item["translated_at"] = translation.get("translated_at") or utc_now()
             if int(reply.get("observed_scans") or 0) < self.reply_settings.stability_scans:
                 queue_item["status"] = "stabilizing"
                 queue_items.append(queue_item)
@@ -437,7 +307,6 @@ class ReplySyncService:
                     "status": "stabilizing",
                     "stable_scans": reply.get("observed_scans"),
                     "collected": collected,
-                    "translated": translated,
                     "sent": 0,
                     "recovered": 0,
                 }
@@ -447,22 +316,7 @@ class ReplySyncService:
                 queue_item.update(status="skipped_deleted", completed_at=completion["completed_at"])
                 queue_items.append(queue_item)
                 continue
-            try:
-                translation = reply.get("translation")
-                if not translation:
-                    translation = await self.translator(reply, thread["target_language"], self.core_settings)
-                    self.cache.save_translation(thread_key, reply_id, translation)
-                    reply["translation"] = translation
-                    translated += 1
-                queue_item.update(status="ready", translated_at=translation.get("translated_at") or utc_now())
-                queue_items.append(queue_item)
-            except (TranslationError, ValueError) as exc:
-                queue_item.update(status="blocked", error=str(exc))
-                queue_items.append(queue_item)
-                self.return_queue.upsert_many(queue_items)
-                result = self._block(thread_key, reply_id, str(exc))
-                result.update({"collected": collected, "translated": translated})
-                return result
+            queue_items.append(queue_item)
 
         self.return_queue.upsert_many(queue_items)
         self.registry.update(thread_key, status="active", blocked_reply_id=None, error=None)
@@ -475,15 +329,14 @@ class ReplySyncService:
             "thread_key": thread_key,
             "status": "collected",
             "collected": collected,
-            "translated": translated,
             "queued": queued,
             "sent": 0,
             "recovered": 0,
         }
 
-    async def _dispatch_return_reply(self, graph: ReplyGraph) -> dict[str, Any]:
+    async def _dispatch_reply(self, graph: ReplyGraph) -> dict[str, Any]:
         now = datetime.now(UTC)
-        next_send_at = self._return_next_send_at()
+        next_send_at = self._next_send_at()
         if next_send_at and now < next_send_at:
             return {
                 "status": "throttled",
@@ -499,7 +352,7 @@ class ReplySyncService:
         while True:
             candidates = [
                 item
-                for item in self.return_queue.ready_heads()
+                for item in self.return_queue.dispatchable_heads()
                 if str(item.get("queue_key") or "") not in attempted
             ]
             if not candidates:
@@ -518,7 +371,6 @@ class ReplySyncService:
             thread = self.registry.get(thread_key)
             if (
                 not thread
-                or thread.get("direction") != "return"
                 or not thread.get("enabled")
                 or not self._direction_enabled(thread)
             ):
@@ -538,8 +390,7 @@ class ReplySyncService:
             if not reply:
                 self.return_queue.mark(thread_key, reply_id, "waiting_source")
                 continue
-            translation = reply.get("translation")
-            if not translation or reply.get("etag") != item.get("source_etag"):
+            if reply.get("etag") != item.get("source_etag"):
                 self.return_queue.mark(thread_key, reply_id, "collected")
                 continue
 
@@ -570,6 +421,18 @@ class ReplySyncService:
                     recovered += 1
                     continue
 
+                translation = reply.get("translation")
+                if not translation:
+                    translation = await self.translator(reply, thread["target_language"], self.core_settings)
+                    self.cache.save_translation(thread_key, reply_id, translation)
+                    reply["translation"] = translation
+                    self.return_queue.mark(
+                        thread_key,
+                        reply_id,
+                        "ready",
+                        translated_at=translation.get("translated_at") or utc_now(),
+                        error=None,
+                    )
                 hosted = await self._download_hosted_contents(graph, thread, reply)
                 payload, fidelity = build_reply_payload(
                     reply,
@@ -577,10 +440,10 @@ class ReplySyncService:
                     hosted,
                     target_language=thread["target_language"],
                 )
+                sent_at = self.return_queue.record_send()
                 created = await graph.create_reply(
                     destination["team_id"], destination["channel_id"], destination["message_id"], payload
                 )
-                sent_at = self.return_queue.record_send()
                 completion = self._record_completion(
                     thread,
                     reply,
@@ -605,7 +468,7 @@ class ReplySyncService:
                     "recovered": recovered,
                     "sent_at": sent_at,
                     "next_send_at": (datetime.fromisoformat(sent_at) + timedelta(
-                        minutes=self.reply_settings.return_send_interval_minutes
+                        minutes=self.reply_settings.send_interval_minutes
                     )).isoformat(),
                 }
             except ReplySequenceConflict as exc:
@@ -613,20 +476,20 @@ class ReplySyncService:
                 self.return_queue.mark(thread_key, reply_id, "blocked", error=str(exc))
                 errors.append(str(exc))
                 blocked_reply_id = reply_id
-            except (GraphAPIError, ReplyFidelityError, ValueError) as exc:
+            except (GraphAPIError, TranslationError, ReplyFidelityError, ValueError) as exc:
                 self.return_queue.mark(thread_key, reply_id, "blocked", error=str(exc))
                 self._block(thread_key, reply_id, str(exc))
                 errors.append(str(exc))
                 blocked_reply_id = reply_id
 
-    def _return_next_send_at(self) -> datetime | None:
+    def _next_send_at(self) -> datetime | None:
         last_sent_at = self.return_queue.last_sent_at()
         if not last_sent_at:
             return None
         parsed = datetime.fromisoformat(last_sent_at.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC) + timedelta(minutes=self.reply_settings.return_send_interval_minutes)
+        return parsed.astimezone(UTC) + timedelta(minutes=self.reply_settings.send_interval_minutes)
 
     async def send_degraded(self, thread_key: str, reply_id: str, graph: ReplyGraph) -> dict[str, Any]:
         thread = self._thread(thread_key)
@@ -656,33 +519,30 @@ class ReplySyncService:
             status = "recovered"
             fidelity = {"degraded": True, "reconciled": True}
         else:
-            if thread.get("direction") == "return":
-                next_send_at = self._return_next_send_at()
-                if next_send_at and datetime.now(UTC) < next_send_at:
-                    raise ValueError(
-                        "The reciprocal reply send interval has not elapsed; next send is allowed at "
-                        + next_send_at.isoformat()
-                    )
+            next_send_at = self._next_send_at()
+            if next_send_at and datetime.now(UTC) < next_send_at:
+                raise ValueError(
+                    "The translated reply send interval has not elapsed; next send is allowed at "
+                    + next_send_at.isoformat()
+                )
             payload, fidelity = build_degraded_reply_payload(
                 reply,
                 translation,
                 target_language=thread["target_language"],
             )
+            self.return_queue.record_send()
             created = await graph.create_reply(
                 destination["team_id"], destination["channel_id"], destination["message_id"], payload
             )
-            if thread.get("direction") == "return":
-                self.return_queue.record_send()
             status = "degraded"
         record = self._record_completion(thread, reply, sequence, created, status, fidelity)
-        if thread.get("direction") == "return":
-            self.return_queue.mark(
-                thread_key,
-                reply_id,
-                status,
-                completed_at=record.get("completed_at"),
-                destination_reply_id=record.get("destination_reply_id"),
-            )
+        self.return_queue.mark(
+            thread_key,
+            reply_id,
+            status,
+            completed_at=record.get("completed_at"),
+            destination_reply_id=record.get("destination_reply_id"),
+        )
         self.registry.update(thread_key, status="active", blocked_reply_id=None, error=None)
         return {"status": status, "record": record}
 

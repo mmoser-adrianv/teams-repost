@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from settings import APP_ROOT
@@ -25,14 +25,16 @@ class ReplySyncSettings(BaseSettings):
         default=False,
         alias="REPLY_SYNC_RETURN_BACKFILL_EXISTING_THREADS",
     )
-    return_send_interval_minutes: int = Field(
+    send_interval_minutes: int = Field(
         default=10,
-        alias="REPLY_SYNC_RETURN_SEND_INTERVAL_MINUTES",
+        validation_alias=AliasChoices(
+            "REPLY_SYNC_SEND_INTERVAL_MINUTES",
+            "REPLY_SYNC_RETURN_SEND_INTERVAL_MINUTES",
+        ),
         ge=1,
         le=1440,
     )
     stability_scans: int = Field(default=2, alias="REPLY_SYNC_STABILITY_SCANS", ge=1, le=10)
-    max_replies_per_run: int = Field(default=50, alias="REPLY_SYNC_MAX_REPLIES_PER_RUN", ge=1, le=500)
     registry_path: Path = Field(
         default=Path(".data/reply-sync/thread-registry.json"),
         alias="REPLY_SYNC_REGISTRY_PATH",
@@ -45,9 +47,9 @@ class ReplySyncSettings(BaseSettings):
         default=Path(".data/reply-sync/reply-history.json"),
         alias="REPLY_SYNC_HISTORY_PATH",
     )
-    return_queue_path: Path = Field(
+    queue_path: Path = Field(
         default=Path(".data/reply-sync/return-queue.json"),
-        alias="REPLY_SYNC_RETURN_QUEUE_PATH",
+        validation_alias=AliasChoices("REPLY_SYNC_QUEUE_PATH", "REPLY_SYNC_RETURN_QUEUE_PATH"),
     )
     lock_path: Path = Field(
         default=Path(".data/reply-sync/automation.lock"),
@@ -93,7 +95,7 @@ def get_reply_sync_settings() -> ReplySyncSettings:
     settings.registry_path = _resolved(settings.registry_path)
     settings.cache_path = _resolved(settings.cache_path)
     settings.history_path = _resolved(settings.history_path)
-    settings.return_queue_path = _resolved(settings.return_queue_path)
+    settings.queue_path = _resolved(settings.queue_path)
     settings.lock_path = _resolved(settings.lock_path)
     settings.temp_folder = _resolved(settings.temp_folder)
     return settings

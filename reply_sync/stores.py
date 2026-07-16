@@ -331,7 +331,7 @@ class ReturnQueue:
         self.store.save(data)
         return deepcopy(item)
 
-    def ready_heads(self) -> list[dict[str, Any]]:
+    def dispatchable_heads(self) -> list[dict[str, Any]]:
         pending_by_thread: dict[str, dict[str, Any]] = {}
         for item in self.list_items():
             if item.get("status") in self.TERMINAL_STATUSES:
@@ -341,7 +341,11 @@ class ReturnQueue:
             if current is None or int(item.get("sequence") or 0) < int(current.get("sequence") or 0):
                 pending_by_thread[thread_key] = item
         return sorted(
-            (item for item in pending_by_thread.values() if item.get("status") == "ready"),
+            (
+                item
+                for item in pending_by_thread.values()
+                if item.get("status") in {"collected", "ready"}
+            ),
             key=lambda item: (
                 str(item.get("source_created_date_time") or ""),
                 str(item.get("thread_key") or ""),

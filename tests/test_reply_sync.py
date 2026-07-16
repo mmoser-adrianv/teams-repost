@@ -121,11 +121,10 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.reply_settings.registry_path = root / "reply-sync" / "registry.json"
         self.reply_settings.cache_path = root / "reply-sync" / "cache.json"
         self.reply_settings.history_path = root / "reply-sync" / "history.json"
-        self.reply_settings.return_queue_path = root / "reply-sync" / "return-queue.json"
+        self.reply_settings.queue_path = root / "reply-sync" / "return-queue.json"
         self.reply_settings.lock_path = root / "reply-sync" / "lock"
         self.reply_settings.temp_folder = root / "reply-sync" / "temp"
         self.reply_settings.stability_scans = 2
-        self.reply_settings.max_replies_per_run = 50
         self.repost_history_path = root / "main-history.json"
         self.core_settings = SimpleNamespace(
             repost_history_path=self.repost_history_path,
@@ -146,6 +145,9 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
             "translated_at": "2026-07-13T00:00:00Z",
             "model": "fake",
         }
+
+    def allow_next_send(self) -> None:
+        self.service.return_queue.record_send((datetime.now(UTC) - timedelta(minutes=11)).isoformat())
 
     def test_auto_enroll_activates_existing_preview_for_backfill(self) -> None:
         preview = self.service.registry.get(self.thread_key)
@@ -373,7 +375,7 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-    async def test_two_stable_scans_then_sends_oldest_first(self) -> None:
+    async def test_primary_backlog_sends_oldest_one_per_interval(self) -> None:
         graph = FakeReplyGraph(
             [
                 source_reply("3", "2026-07-13T00:00:03Z"),
@@ -385,10 +387,18 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
         first = await self.service.run_thread(self.thread_key, graph)
         second = await self.service.run_thread(self.thread_key, graph)
+        immediate = await self.service.run_thread(self.thread_key, graph)
+        self.allow_next_send()
+        third = await self.service.run_thread(self.thread_key, graph)
+        self.allow_next_send()
+        fourth = await self.service.run_thread(self.thread_key, graph)
 
         self.assertEqual(first["status"], "stabilizing")
-        self.assertEqual(second["status"], "completed")
-        self.assertEqual(second["sent"], 3)
+        self.assertEqual(second["sent"], 1)
+        self.assertEqual(immediate["dispatch_status"], "throttled")
+        self.assertEqual(immediate["sent"], 0)
+        self.assertEqual(third["sent"], 1)
+        self.assertEqual(fourth["sent"], 1)
         bodies = [payload["body"]["content"] for payload in graph.created]
         self.assertIn("<strong>原回覆作者：</strong> Author 1", bodies[0])
         self.assertIn('<a href="https://teams.example/source/1">link</a></p><hr>', bodies[0])
@@ -420,6 +430,10 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.activate(self.thread_key, "backfill_all")
         await self.service.run_thread(self.thread_key, graph)
         await self.service.run_thread(self.thread_key, graph)
+        self.allow_next_send()
+        await self.service.run_thread(self.thread_key, graph)
+        self.allow_next_send()
+        await self.service.run_thread(self.thread_key, graph)
         bodies = [payload["body"]["content"] for payload in graph.created]
         self.assertIn("https://teams.example/source/1", bodies[0])
         self.assertIn("https://teams.example/source/2", bodies[1])
@@ -433,10 +447,14 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
         second = await self.service.run_thread(self.thread_key, graph)
         third = await self.service.run_thread(self.thread_key, graph)
+        self.allow_next_send()
+        fourth = await self.service.run_thread(self.thread_key, graph)
 
         self.assertEqual(second["status"], "stabilizing")
         self.assertEqual(second["sent"], 1)
-        self.assertEqual(third["sent"], 1)
+        self.assertEqual(third["dispatch_status"], "throttled")
+        self.assertEqual(third["sent"], 0)
+        self.assertEqual(fourth["sent"], 1)
         self.assertIn("https://teams.example/source/1", graph.created[0]["body"]["content"])
         self.assertIn("https://teams.example/source/2", graph.created[1]["body"]["content"])
 
@@ -461,6 +479,7 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.service.history.get(self.thread_key, "2"))
 
         degraded = await self.service.send_degraded(self.thread_key, "1", graph)
+        self.allow_next_send()
         continued = await self.service.run_thread(self.thread_key, graph)
         self.assertEqual(degraded["status"], "degraded")
         self.assertEqual(continued["sent"], 1)
@@ -476,6 +495,15 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["blocked_reply_id"], "1")
         self.assertIsNone(self.service.history.get(self.thread_key, "1"))
         self.assertIsNone(self.service.history.get(self.thread_key, "2"))
+
+        graph.fail_create = False
+        immediate = await self.service.run_thread(self.thread_key, graph)
+        self.assertEqual(immediate["dispatch_status"], "throttled")
+        self.assertEqual(graph.created, [])
+
+        self.allow_next_send()
+        retry = await self.service.run_thread(self.thread_key, graph)
+        self.assertEqual(retry["sent"], 1)
 
     async def test_existing_destination_marker_recovers_without_duplicate(self) -> None:
         graph = FakeReplyGraph([source_reply("1", "2026-07-13T00:00:01Z")])
@@ -549,11 +577,15 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         primary_result = await self.service.run_thread(self.thread_key, graph)
+        return_throttled = await self.service.run_thread(return_key, graph)
+        self.allow_next_send()
         return_result = await self.service.run_thread(return_key, graph)
         primary_repeat = await self.service.run_thread(self.thread_key, graph)
         return_repeat = await self.service.run_thread(return_key, graph)
 
         self.assertEqual(primary_result["sent"], 1)
+        self.assertEqual(return_throttled["dispatch_status"], "throttled")
+        self.assertEqual(return_throttled["sent"], 0)
         self.assertEqual(return_result["sent"], 1)
         self.assertEqual(primary_repeat["sent"], 0)
         self.assertEqual(return_repeat["sent"], 0)
@@ -562,10 +594,10 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.translation_calls, ["original-human", "translated-human"])
         self.assertEqual(len(graph.created), 2)
 
-    async def test_return_backlog_is_pretranslated_but_dispatched_one_per_interval(self) -> None:
+    async def test_return_backlog_is_translated_and_dispatched_one_per_interval(self) -> None:
         self.reply_settings.return_enabled = True
         self.reply_settings.stability_scans = 1
-        self.reply_settings.return_send_interval_minutes = 10
+        self.reply_settings.send_interval_minutes = 10
         self.service.discover()
         return_key = self.thread_key + "|reply:return"
         self.service.activate(return_key, "backfill_all")
@@ -587,9 +619,9 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["dispatch_status"], "sent")
         self.assertEqual(immediate["sent"], 0)
         self.assertEqual(immediate["dispatch_status"], "throttled")
-        self.assertEqual(self.translation_calls, ["return-1", "return-2", "return-3"])
+        self.assertEqual(self.translation_calls, ["return-1"])
         self.assertEqual(len(graph.created), 1)
-        self.assertEqual(self.service.return_queue.summary()["counts"]["ready"], 2)
+        self.assertEqual(self.service.return_queue.summary()["counts"]["collected"], 2)
 
         self.service.return_queue.record_send((datetime.now(UTC) - timedelta(minutes=11)).isoformat())
         second = await self.service.run_thread(return_key, graph)
@@ -598,6 +630,7 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(second["sent"], 1)
         self.assertEqual(third["sent"], 1)
+        self.assertEqual(self.translation_calls, ["return-1", "return-2", "return-3"])
         self.assertEqual([parent for parent, _ in graph.created_with_parent], ["source-parent"] * 3)
         bodies = [payload["body"]["content"] for payload in graph.created]
         self.assertIn("/return-1", bodies[0])
@@ -663,10 +696,10 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first["sent"], 1)
         self.assertEqual(immediate["sent"], 0)
-        self.assertEqual(sorted(self.translation_calls), ["return-1", "return-2"])
+        self.assertEqual(self.translation_calls, ["return-1"])
         self.assertEqual(len(graph.created), 1)
         self.assertIn("/return-1", graph.created[0]["body"]["content"])
-        self.assertEqual(self.service.return_queue.summary()["counts"]["ready"], 1)
+        self.assertEqual(self.service.return_queue.summary()["counts"]["collected"], 1)
 
     async def test_return_failure_does_not_pause_primary_thread(self) -> None:
         self.reply_settings.return_enabled = True
@@ -871,7 +904,7 @@ class StoreAndGraphTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
 
-            heads = queue.ready_heads()
+            heads = queue.dispatchable_heads()
             sent_at = queue.record_send("2026-07-13T00:10:00+00:00")
 
             self.assertEqual([item["source_reply_id"] for item in heads], ["b-1"])
@@ -917,7 +950,9 @@ class StoreAndGraphTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ReplySyncAlreadyRunning):
                     with ReplySyncLock(path):
                         pass
-            self.assertFalse(path.exists())
+            self.assertTrue(path.exists())
+            with ReplySyncLock(path):
+                pass
 
     async def test_cache_does_not_persist_raw_image_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -944,10 +979,19 @@ class ReplySyncConfigTests(unittest.TestCase):
         self.assertFalse(settings.return_enabled)
         self.assertFalse(settings.return_auto_enroll_new_threads)
         self.assertFalse(settings.return_backfill_existing_threads)
-        self.assertEqual(settings.return_send_interval_minutes, 10)
-        self.assertEqual(settings.return_queue_path, Path(".data/reply-sync/return-queue.json"))
+        self.assertEqual(settings.send_interval_minutes, 10)
+        self.assertEqual(settings.queue_path, Path(".data/reply-sync/return-queue.json"))
         self.assertEqual(settings.registry_path, Path(".data/reply-sync/thread-registry.json"))
         self.assertEqual(settings.flow_list, ["forward", "reverse"])
+
+    def test_legacy_return_queue_settings_remain_compatible(self) -> None:
+        settings = ReplySyncSettings(
+            _env_file=None,
+            REPLY_SYNC_RETURN_SEND_INTERVAL_MINUTES=12,
+            REPLY_SYNC_RETURN_QUEUE_PATH="legacy-return-queue.json",
+        )
+        self.assertEqual(settings.send_interval_minutes, 12)
+        self.assertEqual(settings.queue_path, Path("legacy-return-queue.json"))
 
     def test_rejects_unknown_flow(self) -> None:
         with self.assertRaises(ValueError):
@@ -983,7 +1027,7 @@ class ReplySyncRouterTests(unittest.TestCase):
         self.reply_settings.registry_path = root / "registry.json"
         self.reply_settings.cache_path = root / "cache.json"
         self.reply_settings.history_path = root / "history.json"
-        self.reply_settings.return_queue_path = root / "return-queue.json"
+        self.reply_settings.queue_path = root / "return-queue.json"
         self.reply_settings.lock_path = root / "lock"
         self.reply_settings.temp_folder = root / "temp"
         self.core_settings = SimpleNamespace(

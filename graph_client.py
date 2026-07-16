@@ -171,7 +171,26 @@ class GraphClient:
 
         attempt = 0
         while True:
-            response = await self._client.request(method, url, headers=headers, **kwargs)
+            try:
+                response = await self._client.request(method, url, headers=headers, **kwargs)
+            except httpx.RequestError as exc:
+                if attempt >= self.max_retries:
+                    raise GraphAPIError(
+                        503,
+                        f"Microsoft Graph request failed: {type(exc).__name__}",
+                    ) from exc
+                delay = min(2**attempt, 8)
+                logger.info(
+                    "Retrying Microsoft Graph request after a network error",
+                    extra={
+                        "method": method,
+                        "error_type": type(exc).__name__,
+                        "delay_seconds": delay,
+                    },
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
+                continue
             if response.status_code not in _RETRYABLE_STATUS_CODES or attempt >= self.max_retries:
                 break
             delay = _retry_delay(response, attempt)

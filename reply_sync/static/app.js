@@ -2,9 +2,9 @@ const state = {
   signedIn: false,
   enabled: false,
   returnEnabled: false,
-  returnQueue: {},
-  returnIntervalMinutes: 10,
-  returnNextSendAt: null,
+  replyQueue: {},
+  sendIntervalMinutes: 10,
+  nextSendAt: null,
   threads: [],
 };
 
@@ -13,7 +13,7 @@ const loginLink = document.querySelector("#loginLink");
 const discoverButton = document.querySelector("#discoverButton");
 const refreshButton = document.querySelector("#refreshButton");
 const threadCount = document.querySelector("#threadCount");
-const returnQueueStatus = document.querySelector("#returnQueueStatus");
+const replyQueueStatus = document.querySelector("#replyQueueStatus");
 const threadsNode = document.querySelector("#threads");
 const template = document.querySelector("#threadTemplate");
 const messageNode = document.querySelector("#message");
@@ -43,9 +43,9 @@ async function loadThreads() {
   const payload = await api("/api/reply-sync/threads");
   state.enabled = payload.enabled;
   state.returnEnabled = payload.return_enabled;
-  state.returnQueue = payload.return_queue || {};
-  state.returnIntervalMinutes = payload.return_send_interval_minutes || 10;
-  state.returnNextSendAt = payload.return_next_send_at;
+  state.replyQueue = payload.reply_queue || payload.return_queue || {};
+  state.sendIntervalMinutes = payload.send_interval_minutes || payload.return_send_interval_minutes || 10;
+  state.nextSendAt = payload.next_send_at || payload.return_next_send_at;
   state.threads = payload.threads || [];
   automationBanner.classList.toggle("hidden", state.enabled);
   if (state.enabled) {
@@ -60,11 +60,11 @@ async function loadThreads() {
 function render() {
   threadsNode.replaceChildren();
   threadCount.textContent = `${state.threads.length} thread${state.threads.length === 1 ? "" : "s"}`;
-  const counts = state.returnQueue.counts || {};
+  const counts = state.replyQueue.counts || {};
   const completed = (counts.sent || 0) + (counts.degraded || 0) + (counts.recovered || 0) + (counts.skipped_deleted || 0);
-  const pending = Math.max(0, (state.returnQueue.total || 0) - completed);
-  returnQueueStatus.textContent = ` · Return backlog: ${pending} pending, ${counts.ready || 0} translated · one send every ${state.returnIntervalMinutes} minutes`;
-  returnQueueStatus.classList.toggle("hidden", !state.returnEnabled);
+  const pending = Math.max(0, (state.replyQueue.total || 0) - completed);
+  replyQueueStatus.textContent = ` · Reply backlog: ${pending} pending · one send every ${state.sendIntervalMinutes} minutes`;
+  replyQueueStatus.classList.toggle("hidden", !state.enabled);
   for (const thread of state.threads) threadsNode.append(renderThread(thread));
 }
 
@@ -79,7 +79,7 @@ function renderThread(thread) {
   for (const [label, value] of [
     ["Replies found", thread.discovered_reply_count],
     ["Queued", thread.queued_reply_count],
-    ...(direction === "return" ? [["Return backlog", thread.return_queue_count], ["Translated", thread.return_ready_count]] : []),
+    ["Reply backlog", thread.reply_queue_count ?? thread.return_queue_count],
     ["Completed", thread.completed_reply_count],
     ["Stable scans", thread.stable_scans],
     ["Last sequence", thread.last_contiguous_sequence],

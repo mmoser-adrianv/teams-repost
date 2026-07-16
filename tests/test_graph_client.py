@@ -1,5 +1,7 @@
 import unittest
 
+import httpx
+
 from graph_client import GraphAPIError, GraphClient, encode_sharing_url
 
 
@@ -18,13 +20,16 @@ class FakeResponse:
 
 
 class FakeAsyncClient:
-    def __init__(self, responses: list[FakeResponse]) -> None:
+    def __init__(self, responses: list[FakeResponse | Exception]) -> None:
         self.responses = responses
         self.calls = []
 
     async def request(self, method, url, headers=None, **kwargs):
         self.calls.append({"method": method, "url": url, "headers": headers, "kwargs": kwargs})
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     async def aclose(self) -> None:
         pass
@@ -45,6 +50,37 @@ class GraphClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(team["id"], "team-1")
         self.assertEqual(len(fake.calls), 2)
         self.assertIn("Bearer secret-token", fake.calls[0]["headers"]["Authorization"])
+
+    async def test_retries_network_timeout(self) -> None:
+        request = httpx.Request("GET", "https://graph.example/replies")
+        fake = FakeAsyncClient(
+            [
+                httpx.ReadTimeout("timed out", request=request),
+                FakeResponse(200, {"value": []}),
+            ]
+        )
+        client = GraphClient("token", http_client=fake, max_retries=1)
+
+        result = await client.get_json("/replies")
+
+        self.assertEqual(result, {"value": []})
+        self.assertEqual(len(fake.calls), 2)
+
+    async def test_exhausted_network_timeout_becomes_graph_error(self) -> None:
+        request = httpx.Request("GET", "https://graph.example/replies")
+        fake = FakeAsyncClient(
+            [
+                httpx.ReadTimeout("timed out", request=request),
+                httpx.ReadTimeout("timed out", request=request),
+            ]
+        )
+        client = GraphClient("token", http_client=fake, max_retries=1)
+
+        with self.assertRaises(GraphAPIError) as context:
+            await client.get_json("/replies")
+
+        self.assertEqual(context.exception.status_code, 503)
+        self.assertIn("ReadTimeout", str(context.exception))
 
     async def test_encodes_channel_path_when_creating_message(self) -> None:
         fake = FakeAsyncClient([FakeResponse(201, {"id": "new-message"})])
