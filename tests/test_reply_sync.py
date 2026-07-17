@@ -72,6 +72,12 @@ class FakeReplyGraph:
         self.destination_replies.append(created)
         return created
 
+    async def get_reply(self, team_id, channel_id, parent_message_id, reply_id):
+        for reply in await self.list_replies(team_id, channel_id, parent_message_id):
+            if str(reply.get("id")) == str(reply_id):
+                return reply
+        raise GraphAPIError(404, "Reply not found")
+
     async def list_hosted_contents(self, team_id, channel_id, parent_message_id, reply_id):
         return [{"id": hosted_id} for hosted_id in self.hosted]
 
@@ -701,6 +707,67 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/return-1", graph.created[0]["body"]["content"])
         self.assertEqual(self.service.return_queue.summary()["counts"]["collected"], 1)
 
+    async def test_run_all_dispatches_before_and_during_full_thread_scan(self) -> None:
+        events: list[str] = []
+        self.service.discover = lambda: {"added": 0, "updated": 0, "unlinked": 0, "total": 2}
+        self.service.return_queue.dispatchable_heads = lambda: [{"queue_key": "queued-at-start"}]
+        self.service.registry.list_threads = lambda: [
+            {"thread_key": "thread-1", "enabled": True},
+            {"thread_key": "thread-2", "enabled": True},
+        ]
+        self.service._direction_enabled = lambda thread: True
+
+        async def collect(thread_key: str, graph: FakeReplyGraph) -> dict[str, object]:
+            events.append(f"collect:{thread_key}")
+            return {"thread_key": thread_key, "status": "collected", "sent": 0, "recovered": 0}
+
+        dispatch_count = 0
+
+        async def dispatch(
+            graph: FakeReplyGraph,
+            allowed_queue_keys: set[str] | None = None,
+        ) -> dict[str, object]:
+            nonlocal dispatch_count
+            dispatch_count += 1
+            events.append("dispatch")
+            if dispatch_count in {1, 3}:
+                return {"status": "sent", "sent": 1, "recovered": 0}
+            return {"status": "throttled", "sent": 0, "recovered": 0}
+
+        self.service._collect_thread = collect
+        self.service._dispatch_reply = dispatch
+
+        result = await self.service.run_all(FakeReplyGraph())
+
+        self.assertEqual(
+            events,
+            [
+                "dispatch",
+                "collect:thread-1",
+                "dispatch",
+                "collect:thread-2",
+                "dispatch",
+                "dispatch",
+            ],
+        )
+        self.assertEqual(result["sent"], 2)
+
+    async def test_dispatch_defers_a_source_reply_edited_after_collection(self) -> None:
+        self.reply_settings.stability_scans = 1
+        graph = FakeReplyGraph([source_reply("1", "2026-07-13T00:00:01Z")])
+        self.service.activate(self.thread_key, "backfill_all")
+        await self.service._collect_thread(self.thread_key, graph)
+        graph.source_replies[0]["etag"] = "edited-after-collection"
+
+        result = await self.service._dispatch_reply(graph)
+
+        self.assertEqual(result["status"], "queue_empty")
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(len(graph.created), 0)
+        queued = self.service.return_queue.get(self.thread_key, "1")
+        self.assertEqual(queued["status"], "collected")
+        self.assertEqual(queued["source_etag"], "edited-after-collection")
+
     async def test_return_failure_does_not_pause_primary_thread(self) -> None:
         self.reply_settings.return_enabled = True
         self.reply_settings.stability_scans = 1
@@ -979,7 +1046,7 @@ class ReplySyncConfigTests(unittest.TestCase):
         self.assertFalse(settings.return_enabled)
         self.assertFalse(settings.return_auto_enroll_new_threads)
         self.assertFalse(settings.return_backfill_existing_threads)
-        self.assertEqual(settings.send_interval_minutes, 2)
+        self.assertEqual(settings.send_interval_minutes, 1)
         self.assertEqual(settings.queue_path, Path(".data/reply-sync/return-queue.json"))
         self.assertEqual(settings.registry_path, Path(".data/reply-sync/thread-registry.json"))
         self.assertEqual(settings.flow_list, ["forward", "reverse"])

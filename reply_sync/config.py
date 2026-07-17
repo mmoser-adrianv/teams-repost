@@ -26,7 +26,7 @@ class ReplySyncSettings(BaseSettings):
         alias="REPLY_SYNC_RETURN_BACKFILL_EXISTING_THREADS",
     )
     send_interval_minutes: int = Field(
-        default=2,
+        default=1,
         validation_alias=AliasChoices(
             "REPLY_SYNC_SEND_INTERVAL_MINUTES",
             "REPLY_SYNC_RETURN_SEND_INTERVAL_MINUTES",

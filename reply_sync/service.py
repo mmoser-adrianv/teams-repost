@@ -191,12 +191,26 @@ class ReplySyncService:
     async def run_all(self, graph: ReplyGraph) -> dict[str, Any]:
         discovery = self.discover()
         results: list[dict[str, Any]] = []
+        queued_at_start = {
+            str(item.get("queue_key") or "")
+            for item in self.return_queue.dispatchable_heads()
+        }
+        dispatch_results: list[dict[str, Any]] = []
+        if queued_at_start:
+            dispatch_results.append(await self._dispatch_reply(graph, queued_at_start))
         threads = self.registry.list_threads()
         for thread in threads:
             if not self._direction_enabled(thread) or not thread.get("enabled"):
                 continue
             results.append(await self._collect_thread(thread["thread_key"], graph))
-        results.append(await self._dispatch_reply(graph))
+            if queued_at_start:
+                dispatch = await self._dispatch_reply(graph, queued_at_start)
+                if dispatch.get("status") not in {"queue_empty", "throttled"}:
+                    dispatch_results.append(dispatch)
+        final_dispatch = await self._dispatch_reply(graph)
+        if not dispatch_results or final_dispatch.get("status") not in {"queue_empty", "throttled"}:
+            dispatch_results.append(final_dispatch)
+        results.extend(dispatch_results)
         return {
             "status": "completed",
             "discovery": discovery,
@@ -334,7 +348,11 @@ class ReplySyncService:
             "recovered": 0,
         }
 
-    async def _dispatch_reply(self, graph: ReplyGraph) -> dict[str, Any]:
+    async def _dispatch_reply(
+        self,
+        graph: ReplyGraph,
+        allowed_queue_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
         now = datetime.now(UTC)
         next_send_at = self._next_send_at()
         if next_send_at and now < next_send_at:
@@ -354,6 +372,10 @@ class ReplySyncService:
                 item
                 for item in self.return_queue.dispatchable_heads()
                 if str(item.get("queue_key") or "") not in attempted
+                and (
+                    allowed_queue_keys is None
+                    or str(item.get("queue_key") or "") in allowed_queue_keys
+                )
             ]
             if not candidates:
                 return {
@@ -396,6 +418,21 @@ class ReplySyncService:
 
             destination = thread.get("destination") or {}
             try:
+                source = thread["source"]
+                latest_source_reply = await graph.get_reply(
+                    source["team_id"], source["channel_id"], source["message_id"], reply_id
+                )
+                latest_source_etag = str(
+                    latest_source_reply.get("etag") or latest_source_reply.get("@odata.etag") or ""
+                )
+                if latest_source_etag != str(item.get("source_etag") or ""):
+                    self.return_queue.mark(
+                        thread_key,
+                        reply_id,
+                        "collected",
+                        source_etag=latest_source_etag,
+                    )
+                    continue
                 destination_replies = await graph.list_replies(
                     destination["team_id"], destination["channel_id"], destination["message_id"]
                 )
