@@ -38,7 +38,7 @@ services:
     command: >
       sh -c "while true; do
         python -m reply_sync.worker --once;
-        sleep 300;
+        sleep 60;
       done"
     depends_on:
       - web

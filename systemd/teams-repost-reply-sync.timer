@@ -1,9 +1,9 @@
 [Unit]
-Description=Run translated reply synchronization every 5 minutes
+Description=Run translated reply synchronization every minute
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=1min
 AccuracySec=30s
 Persistent=true
 Unit=teams-repost-reply-sync.service

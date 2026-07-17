@@ -71,7 +71,7 @@ Set `REPLY_SYNC_AUTO_ENROLL_NEW_THREADS=true` to activate newly discovered mappi
 
 Reciprocal reply synchronization is separately protected by `REPLY_SYNC_RETURN_ENABLED=false`. When enabled, each fully linked mapping gets a return thread whose source is the translated post and whose destination is the original post. Replies created by either paired thread are excluded from the other thread using reply history, preventing translation loops. Return threads are independent, so a return-side failure does not pause the existing original-to-translated thread.
 
-All translated replies in both directions use one persistent queue at `REPLY_SYNC_QUEUE_PATH`. Complete source threads are scanned into the queue without creating Teams notifications. A global dispatcher selects the oldest eligible thread head, translates it when its turn arrives, and posts at most one Teams reply every `REPLY_SYNC_SEND_INTERVAL_MINUTES` (10 minutes by default). Ordering is preserved within each thread, and both the backlog and last-send timestamp survive container and computer restarts.
+All translated replies in both directions use one persistent queue at `REPLY_SYNC_QUEUE_PATH`. Complete source threads are scanned into the queue without creating Teams notifications. A global dispatcher selects the oldest eligible thread head, translates it when its turn arrives, and posts at most one Teams reply every `REPLY_SYNC_SEND_INTERVAL_MINUTES` (2 minutes by default). Ordering is preserved within each thread, and both the backlog and last-send timestamp survive container and computer restarts.
 
 For a controlled historical rollout, set `REPLY_SYNC_RETURN_BACKFILL_EXISTING_THREADS=true`. This promotes existing return previews to `backfill_all` but does not reactivate explicitly paused or superseded threads. Set `REPLY_SYNC_RETURN_AUTO_ENROLL_NEW_THREADS=true` to enroll future mappings as well. Historical and live replies in either direction enter the same ordered queue and remain subject to the global send interval. Setting `REPLY_SYNC_RETURN_ENABLED=false` makes retained return threads dormant without deleting their registry, cache, queue, or history state; primary threads remain queued and rate-limited.
 
@@ -81,7 +81,7 @@ Run one pass only after testing the manager and setting `REPLY_SYNC_ENABLED=true
 python -m reply_sync.worker --once
 ```
 
-The optional `reply-sync-automation` Compose service is behind the `reply-sync` profile, and the separate `teams-repost-reply-sync.timer` systemd template schedules the same one-shot worker every five minutes.
+The optional `reply-sync-automation` Compose service is behind the `reply-sync` profile, and the separate `teams-repost-reply-sync.timer` systemd template schedules the same one-shot worker every minute. The worker cadence is deliberately shorter than the two-minute send interval so a scan does not add another full send interval to the backlog delay.
 
 4. Run the app.
 

@@ -3,7 +3,7 @@ const state = {
   enabled: false,
   returnEnabled: false,
   replyQueue: {},
-  sendIntervalMinutes: 10,
+  sendIntervalMinutes: 2,
   nextSendAt: null,
   threads: [],
 };
@@ -44,7 +44,7 @@ async function loadThreads() {
   state.enabled = payload.enabled;
   state.returnEnabled = payload.return_enabled;
   state.replyQueue = payload.reply_queue || payload.return_queue || {};
-  state.sendIntervalMinutes = payload.send_interval_minutes || payload.return_send_interval_minutes || 10;
+  state.sendIntervalMinutes = payload.send_interval_minutes || payload.return_send_interval_minutes || 2;
   state.nextSendAt = payload.next_send_at || payload.return_next_send_at;
   state.threads = payload.threads || [];
   automationBanner.classList.toggle("hidden", state.enabled);

@@ -979,7 +979,7 @@ class ReplySyncConfigTests(unittest.TestCase):
         self.assertFalse(settings.return_enabled)
         self.assertFalse(settings.return_auto_enroll_new_threads)
         self.assertFalse(settings.return_backfill_existing_threads)
-        self.assertEqual(settings.send_interval_minutes, 10)
+        self.assertEqual(settings.send_interval_minutes, 2)
         self.assertEqual(settings.queue_path, Path(".data/reply-sync/return-queue.json"))
         self.assertEqual(settings.registry_path, Path(".data/reply-sync/thread-registry.json"))
         self.assertEqual(settings.flow_list, ["forward", "reverse"])
