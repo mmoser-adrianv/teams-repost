@@ -100,7 +100,7 @@ The browser sign-in also seeds the backend MSAL token cache used by automation. 
 Docker Desktop can run the app without `systemd`. The Compose setup runs two services from the same image:
 
 - `web` serves the manager UI and API on `http://localhost:8000/`.
-- `automation` runs `python -m automation_worker --once`, sleeps for 5 minutes, and repeats.
+- `automation` runs `python -m automation_worker --once`, sleeps for 1 minute, and repeats.
 
 Copy `.env.example` to `.env`, fill in the settings, and keep:
 

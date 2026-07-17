@@ -1,9 +1,9 @@
 [Unit]
-Description=Run Teams Repost automation every 5 minutes
+Description=Run Teams Repost automation every minute
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=1min
 AccuracySec=30s
 Persistent=true
 Unit=teams-repost-automation.service
