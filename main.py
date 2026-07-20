@@ -41,6 +41,7 @@ from message_rebuilder import (
 from post_cache import PostCache, is_presentable_post
 from repost_history import RepostHistory, build_manual_repost_record, build_repost_record
 from reply_sync.router import create_reply_sync_router
+from resource_catalog.router import create_resource_catalogue_router
 from settings import get_settings
 from teams_url_parser import TeamsMessageLink
 from teams_url_parser import TeamsUrlParseError
@@ -59,6 +60,7 @@ app = FastAPI(title="Teams Repost Graph POC", version="0.1.0")
 app.add_middleware(SessionMiddleware, secret_key=settings.session_secret, same_site="lax", https_only=False)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(create_reply_sync_router(settings))
+app.include_router(create_resource_catalogue_router(settings))
 
 
 class ForwardMessageRequest(BaseModel):
@@ -413,7 +415,7 @@ async def _translate_post(post: dict, target_language: str, settings) -> dict:
 
 
 def _safe_auth_return_path(value: str | None) -> str:
-    return value if value in {"/", "/reverse", "/reply-sync"} else "/"
+    return value if value in {"/", "/reverse", "/reply-sync", "/resources"} else "/"
 
 
 def _repost_flow(flow_name: str) -> RepostFlow:
