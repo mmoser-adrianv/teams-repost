@@ -1,8 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,27 +59,6 @@ class Settings(BaseSettings):
         default_factory=lambda: DEFAULT_DATA_DIR / "automation.lock",
         alias="AUTOMATION_LOCK_PATH",
     )
-    resource_catalog_base_url: str = Field(
-        default="https://magic-room.mmoser.app",
-        alias="RESOURCE_CATALOG_BASE_URL",
-    )
-    resource_catalog_api_token: SecretStr | None = Field(default=None, alias="RESOURCE_CATALOG_API_TOKEN")
-    resource_catalog_request_timeout_seconds: float = Field(
-        default=15.0,
-        gt=0,
-        le=120,
-        alias="RESOURCE_CATALOG_REQUEST_TIMEOUT_SECONDS",
-    )
-    resource_catalog_poll_interval_seconds: int = Field(
-        default=60,
-        ge=15,
-        le=3600,
-        alias="RESOURCE_CATALOG_POLL_INTERVAL_SECONDS",
-    )
-    resource_catalog_state_path: Path = Field(
-        default_factory=lambda: DEFAULT_DATA_DIR / "resource-catalog-state.json",
-        alias="RESOURCE_CATALOG_STATE_PATH",
-    )
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -95,17 +73,6 @@ class Settings(BaseSettings):
     @classmethod
     def validate_automation_flows(cls, value: str) -> str:
         parse_automation_flows(value)
-        return value
-
-    @field_validator("resource_catalog_base_url")
-    @classmethod
-    def validate_resource_catalog_base_url(cls, value: str) -> str:
-        value = value.strip().rstrip("/")
-        parsed = urlsplit(value)
-        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("RESOURCE_CATALOG_BASE_URL must be an HTTP or HTTPS origin")
-        if parsed.path or parsed.query or parsed.fragment:
-            raise ValueError("RESOURCE_CATALOG_BASE_URL must not contain a path, query, or fragment")
         return value
 
     @property
@@ -134,7 +101,6 @@ def get_settings() -> Settings:
     settings.post_cache_path = _app_relative_path(settings.post_cache_path)
     settings.exception_list_path = _app_relative_path(settings.exception_list_path)
     settings.automation_lock_path = _app_relative_path(settings.automation_lock_path)
-    settings.resource_catalog_state_path = _app_relative_path(settings.resource_catalog_state_path)
     if settings.reverse_exception_list_path is None:
         settings.reverse_exception_list_path = settings.exception_list_path.with_name(
             f"{settings.exception_list_path.stem}-reverse{settings.exception_list_path.suffix}"
@@ -148,7 +114,6 @@ def get_settings() -> Settings:
     settings.exception_list_path.parent.mkdir(parents=True, exist_ok=True)
     settings.reverse_exception_list_path.parent.mkdir(parents=True, exist_ok=True)
     settings.automation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-    settings.resource_catalog_state_path.parent.mkdir(parents=True, exist_ok=True)
     return settings
 
 
