@@ -53,7 +53,7 @@ GRAPH_SCOPES=offline_access ChannelMessage.Read.All ChannelMessage.Send
 
 `POST_CACHE_PATH` stores pulled source-channel posts separately from repost history. `POST_CACHE_MAX_REFRESH_PAGES` limits how many Microsoft Graph pages a refresh checks while looking for posts newer than the latest cached post.
 
-`EXCEPTION_LIST_PATH` stores English-side email addresses that should be skipped. `REVERSE_EXCEPTION_LIST_PATH` stores the separate Chinese-side list; when it is omitted, the app uses a sibling file named like `exception-list-reverse.json`. Each manager UI can add or remove addresses for its own side, and the matching posts API excludes cached or newly pulled posts whose available sender email matches that side's list.
+`EXCEPTION_LIST_PATH` stores English-side email addresses that should be skipped. `REVERSE_EXCEPTION_LIST_PATH` stores the separate Chinese-side list; when it is omitted, the app uses a sibling file named like `exception-list-reverse.json`. Each manager UI can add or remove addresses for its own side. The matching posts API excludes cached or newly pulled posts whose sender email matches that side's list. Because Microsoft Graph's Teams sender identity normally omits email addresses, the app falls back to matching the email alias against the normalized Teams display name when no email is available.
 
 `OPENAI_API_KEY` enables the per-post translation button in the manager UI. The default page translates the configured English source channel to `OPENAI_TRANSLATION_TARGET` and reposts to the configured destination channel. The reverse page at `/reverse` reads the configured destination channel, translates posts to English (`en`), and reposts to the configured source channel. Translations are generated with `OPENAI_TRANSLATION_MODEL` and saved under each post in `POST_CACHE_PATH`, so already translated posts can be toggled without another OpenAI call. The manager Repost button posts the cached translation, not the original body; if the post is not translated yet, the UI translates it first.
 
@@ -114,7 +114,7 @@ Start both services with:
 docker compose up --build
 ```
 
-Both services mount `.data/` into the container, so the MSAL token cache, post cache, repost history, exception lists, and automation lock persist across container restarts. Keep `AUTOMATION_ENABLED=false` until you have signed in through the manager UI and confirmed manual read, translate, and repost behavior. To enable unattended reposting, set `AUTOMATION_ENABLED=true` in `.env` and restart Compose:
+Both services mount `.data/` into the container, so the MSAL token cache, post cache, repost history, exception lists, and harmless automation lock filename persist across container restarts. The lock itself is managed by the operating system, so crashes and container restarts release it automatically. Keep `AUTOMATION_ENABLED=false` until you have signed in through the manager UI and confirmed manual read, translate, and repost behavior. To enable unattended reposting, set `AUTOMATION_ENABLED=true` in `.env` and restart Compose:
 
 ```powershell
 docker compose up -d

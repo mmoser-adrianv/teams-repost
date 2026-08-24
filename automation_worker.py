@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import sys
-from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from fastapi import HTTPException
 
@@ -31,20 +31,34 @@ class AutomationAlreadyRunning(RuntimeError):
 class AutomationLock:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._handle: TextIO | None = None
 
     def __enter__(self) -> "AutomationLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
         try:
-            descriptor = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
             raise AutomationAlreadyRunning("Automation worker is already running.") from exc
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(f"pid={os.getpid()}\n")
+        except Exception:
+            handle.close()
+            raise
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        self._handle = handle
         return self
 
     def __exit__(self, *_: object) -> None:
-        with suppress(FileNotFoundError):
-            self.path.unlink()
+        if self._handle is None:
+            return
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
 
 
 async def run_once() -> dict[str, Any]:
@@ -161,6 +175,12 @@ async def process_flow(flow_name: str, token: str) -> dict[str, Any]:
                 extra={"flow": flow.name, "message_id": message_id, "target_language": target_language},
             )
             continue
+        if exceptions.matches_post(post):
+            logger.info(
+                "Automation skipped message from exception list",
+                extra={"flow": flow.name, "message_id": message_id, "author": post.get("author")},
+            )
+            continue
         try:
             translated = await _ensure_translation(flow, post, target_language, cache)
             if translated:
@@ -226,6 +246,7 @@ def _automation_candidate_posts(
         sys.maxsize,
         exceptions.email_set(),
         flow.skipped_body_prefixes,
+        excluded_author_matcher=exceptions.matches_post,
     )
     posts: list[dict[str, Any]] = []
     already_reposted = 0

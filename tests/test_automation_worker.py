@@ -13,6 +13,7 @@ os.environ.setdefault("DESTINATION_CHANNEL_ID", "19:dest@thread.tacv2")
 
 import automation_worker  # noqa: E402
 import main as app_main  # noqa: E402
+from exception_list import ExceptionList  # noqa: E402
 from graph_client import GraphAPIError  # noqa: E402
 from post_cache import PostCache  # noqa: E402
 from repost_history import RepostHistory  # noqa: E402
@@ -268,6 +269,46 @@ class AutomationWorkerTests(unittest.TestCase):
         self.assertEqual(self.translation_calls, [])
         self.assertEqual(self.graph.create_calls, 0)
 
+    def test_real_teams_sender_without_email_is_skipped_by_exception_alias(self) -> None:
+        app_main.settings.automation_flows = "forward"
+        ExceptionList(app_main.settings.exception_list_path).add("laceyl@mmoser.com")
+        self.graph.messages["forward-msg"] = {
+            "from": {
+                "user": {
+                    "id": "0ce5a181-9a6c-425e-b6f3-8cd7866be8e6",
+                    "displayName": "LaceyLi - M Moser Associates",
+                    "userIdentityType": "aadUser",
+                }
+            }
+        }
+
+        result = asyncio.run(automation_worker.run_once())
+
+        flow = result["flows"][0]
+        self.assertEqual(flow["refresh"]["posts_skipped_by_exception"], 1)
+        self.assertEqual(flow["checked"], 0)
+        self.assertEqual(self.translation_calls, [])
+        self.assertEqual(self.graph.create_calls, 0)
+
+    def test_legacy_cached_sender_without_email_is_not_automated(self) -> None:
+        excluded_post = {
+            **_cached_post("forward-msg"),
+            "author": "LaceyLi - M Moser Associates",
+            "author_email": None,
+        }
+        PostCache(app_main.settings.post_cache_path).upsert_posts(
+            "source-team", "19:source@thread.tacv2", [excluded_post]
+        )
+        ExceptionList(app_main.settings.exception_list_path).add("laceyl@mmoser.com")
+        app_main.settings.automation_flows = "forward"
+        self.graph.pages_by_team = {"source-team": []}
+
+        result = asyncio.run(automation_worker.run_once())
+
+        self.assertEqual(result["flows"][0]["checked"], 0)
+        self.assertEqual(self.translation_calls, [])
+        self.assertEqual(self.graph.create_calls, 0)
+
     def test_repost_failure_does_not_write_success_history(self) -> None:
         cache = PostCache(app_main.settings.post_cache_path)
         post = _cached_post("forward-msg")
@@ -289,13 +330,24 @@ class AutomationWorkerTests(unittest.TestCase):
             )
         )
 
-    def test_existing_lock_prevents_overlapping_run(self) -> None:
-        app_main.settings.automation_lock_path.write_text("pid=1\n", encoding="utf-8")
+    def test_active_lock_prevents_overlapping_run(self) -> None:
         automation_worker.acquire_persistent_access_token = lambda settings: self.fail("auth should not be called")
 
-        result = asyncio.run(automation_worker.run_once())
+        with automation_worker.AutomationLock(app_main.settings.automation_lock_path):
+            result = asyncio.run(automation_worker.run_once())
 
         self.assertEqual(result["status"], "locked")
+        self.assertTrue(app_main.settings.automation_lock_path.exists())
+
+    def test_stale_lock_filename_does_not_prevent_a_new_lock(self) -> None:
+        app_main.settings.automation_lock_path.write_text("pid=1\n", encoding="utf-8")
+
+        with automation_worker.AutomationLock(app_main.settings.automation_lock_path):
+            self.assertEqual(
+                app_main.settings.automation_lock_path.read_text(encoding="utf-8"),
+                f"pid={os.getpid()}\n",
+            )
+
         self.assertTrue(app_main.settings.automation_lock_path.exists())
 
 

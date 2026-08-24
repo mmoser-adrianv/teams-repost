@@ -2,7 +2,12 @@ import json
 import types
 import unittest
 
-from translation_service import HtmlTextDocument, OpenAITranslationService, TranslationError
+from translation_service import (
+    MAX_TRANSLATION_SEGMENTS_PER_REQUEST,
+    HtmlTextDocument,
+    OpenAITranslationService,
+    TranslationError,
+)
 
 
 class FakeResponse:
@@ -25,6 +30,36 @@ class FakeResponses:
 class FakeClient:
     def __init__(self, output_text: str) -> None:
         self.responses = FakeResponses(output_text)
+
+
+class EchoResponses:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        payload = json.loads(kwargs["input"][1]["content"])
+        return FakeResponse(json.dumps([f"translated:{segment}" for segment in payload["segments"]]))
+
+
+class EchoClient:
+    def __init__(self) -> None:
+        self.responses = EchoResponses()
+
+
+class SplitRetryResponses(EchoResponses):
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        payload = json.loads(kwargs["input"][1]["content"])
+        segments = payload["segments"]
+        if len(segments) > 1:
+            return FakeResponse(json.dumps(["wrong count"]))
+        return FakeResponse(json.dumps([f"translated:{segments[0]}"]))
+
+
+class SplitRetryClient:
+    def __init__(self) -> None:
+        self.responses = SplitRetryResponses()
 
 
 def settings():
@@ -75,11 +110,35 @@ class OpenAITranslationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.responses.calls), 1)
 
     async def test_rejects_mismatched_segment_count(self) -> None:
-        client = FakeClient(json.dumps(["only one"]))
+        client = FakeClient(json.dumps([]))
         service = OpenAITranslationService(settings(), client=client)
 
         with self.assertRaises(TranslationError):
             await service.translate_post({"subject": "Subject", "body_html": "<p>Hello</p>"}, "zh-Hans")
+
+    async def test_batches_large_segment_sets_without_changing_order(self) -> None:
+        client = EchoClient()
+        service = OpenAITranslationService(settings(), client=client)
+        segments = [f"segment-{index}" for index in range(MAX_TRANSLATION_SEGMENTS_PER_REQUEST * 2 + 5)]
+
+        translated = await service._translate_segments(segments, "zh-Hans")
+
+        self.assertEqual(translated, [f"translated:{segment}" for segment in segments])
+        self.assertEqual(len(client.responses.calls), 3)
+        request_sizes = [
+            len(json.loads(call["input"][1]["content"])["segments"])
+            for call in client.responses.calls
+        ]
+        self.assertEqual(request_sizes, [12, 12, 5])
+
+    async def test_retries_mismatched_batches_in_smaller_validated_groups(self) -> None:
+        client = SplitRetryClient()
+        service = OpenAITranslationService(settings(), client=client)
+
+        translated = await service._translate_segments(["one", "two"], "zh-Hans")
+
+        self.assertEqual(translated, ["translated:one", "translated:two"])
+        self.assertEqual(len(client.responses.calls), 3)
 
     async def test_rejects_invalid_json(self) -> None:
         client = FakeClient("not json")

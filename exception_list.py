@@ -8,6 +8,7 @@ from typing import Any
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_IDENTITY_KEY_RE = re.compile(r"[^a-z0-9]+")
 
 
 class ExceptionList:
@@ -24,6 +25,21 @@ class ExceptionList:
     def contains(self, email: str | None) -> bool:
         normalized = normalize_email(email)
         return bool(normalized and normalized in self.email_set())
+
+    def matches_sender(self, email: str | None = None, display_name: str | None = None) -> bool:
+        """Match Graph senders even though teamworkUserIdentity omits email addresses."""
+        emails = self.email_set()
+        normalized_email = normalize_email(email)
+        if normalized_email:
+            return normalized_email in emails
+
+        display_key = normalize_identity_key(display_name)
+        if not display_key:
+            return False
+        return any(_email_alias_matches_display_name(excluded_email, display_key) for excluded_email in emails)
+
+    def matches_post(self, post: dict[str, Any]) -> bool:
+        return self.matches_sender(post.get("author_email"), post.get("author"))
 
     def add(self, email: str) -> list[str]:
         normalized = normalize_email(email)
@@ -89,3 +105,22 @@ def normalize_email(email: str | None) -> str | None:
         return None
     normalized = email.strip().lower()
     return normalized if _EMAIL_RE.match(normalized) else None
+
+
+def normalize_identity_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = _IDENTITY_KEY_RE.sub("", value.strip().lower())
+    return normalized or None
+
+
+def _email_alias_matches_display_name(email: str, display_key: str) -> bool:
+    local_part = email.split("@", 1)[0]
+    alias = normalize_identity_key(local_part)
+    if not alias:
+        return False
+    if display_key == alias:
+        return True
+    # M Moser email aliases use the first name plus surname initial, while Teams
+    # commonly returns a concatenated full display name such as "LaceyLi".
+    return len(alias) >= 5 and display_key.startswith(alias)

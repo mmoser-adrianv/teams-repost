@@ -39,6 +39,21 @@ class ExceptionListTests(unittest.TestCase):
     def test_normalize_email_rejects_empty_values(self) -> None:
         self.assertIsNone(normalize_email(""))
 
+    def test_matches_real_teams_sender_shape_by_email_alias(self) -> None:
+        self.exceptions.add("laceyl@mmoser.com")
+
+        self.assertTrue(self.exceptions.matches_sender(None, "LaceyLi - M Moser Associates"))
+
+    def test_does_not_match_different_display_name(self) -> None:
+        self.exceptions.add("laceyl@mmoser.com")
+
+        self.assertFalse(self.exceptions.matches_sender(None, "LanceLee - M Moser Associates"))
+
+    def test_available_non_excluded_email_overrides_display_name_fallback(self) -> None:
+        self.exceptions.add("alex@example.com")
+
+        self.assertFalse(self.exceptions.matches_sender("jamie@example.com", "Alex"))
+
 
 if __name__ == "__main__":
     unittest.main()

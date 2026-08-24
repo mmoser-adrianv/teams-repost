@@ -42,6 +42,7 @@ class FakeGraph:
         self.fail_create_with_hosted_contents = False
         self.fail_file_upload = False
         self.fail_get_message_ids = set()
+        self.missing_hosted_content_ids = set()
         self.hosted_content_bytes = b"image-bytes"
         self.hosted_content_type = "image/png"
         self.messages = {}
@@ -88,6 +89,8 @@ class FakeGraph:
         return [{"id": "image-1"}]
 
     async def download_message_hosted_content(self, team_id, channel_id, message_id, hosted_content_id, parent_message_id=None):
+        if hosted_content_id in self.missing_hosted_content_ids:
+            raise GraphAPIError(404, "UnknownError")
         return self.hosted_content_bytes, self.hosted_content_type
 
     async def create_channel_message(self, team_id, channel_id, payload):
@@ -405,6 +408,16 @@ class MainApiTests(unittest.TestCase):
         self.assertIn('src="/api/flows/reverse/posts/msg-1/images/1"', payload["posts"][0]["body_html"])
         self.assertEqual(payload["posts"][0]["embedded_images"][0]["download_url"], "/api/flows/reverse/posts/msg-1/images/1")
 
+    def test_missing_embedded_image_returns_placeholder_instead_of_server_error(self) -> None:
+        self.graph.missing_hosted_content_ids.add("image-1")
+
+        response = self.client.get("/api/flows/reverse/posts/msg-1/images/1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/svg+xml")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertIn(b"Embedded image unavailable", response.content)
+
     def test_reverse_refresh_skips_body_that_starts_with_original_author_header(self) -> None:
         self.graph.pages = [
             {
@@ -537,6 +550,25 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(payload["cache"]["posts_skipped_by_exception"], 1)
         cache = PostCache(main.settings.post_cache_path)
         self.assertEqual(cache.list_posts("source-team", "19:source@thread.tacv2"), [])
+
+    def test_refresh_skips_real_teams_sender_without_email_by_exception_alias(self) -> None:
+        ExceptionList(main.settings.exception_list_path).add("laceyl@mmoser.com")
+        self.graph.messages["msg-1"] = {
+            "from": {
+                "user": {
+                    "id": "0ce5a181-9a6c-425e-b6f3-8cd7866be8e6",
+                    "displayName": "LaceyLi - M Moser Associates",
+                    "userIdentityType": "aadUser",
+                }
+            }
+        }
+
+        response = self.client.get("/api/posts?limit=5&refresh=true")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["posts"], [])
+        self.assertEqual(response.json()["cache"]["posts_skipped_by_exception"], 1)
+        self.assertEqual(PostCache(main.settings.post_cache_path).list_posts("source-team", "19:source@thread.tacv2"), [])
 
     def test_refresh_skips_posts_with_no_presentable_content(self) -> None:
         self.graph.pages = [{"messages": [{"id": "empty-msg", "subject": "Teams message"}], "next_link": None}]
@@ -811,6 +843,23 @@ class MainApiTests(unittest.TestCase):
         post = cache.get_post("source-team", "19:source@thread.tacv2", "msg-1")
         self.assertEqual(post["translations"]["zh-Hans"]["subject"], "Translated msg-1")
 
+    def test_translate_blocks_excluded_cached_sender_without_email(self) -> None:
+        excluded_post = {
+            **self._cached_post("msg-1", "2026-06-01T01:02:03Z"),
+            "author": "LaceyLi - M Moser Associates",
+            "author_email": None,
+        }
+        PostCache(main.settings.post_cache_path).upsert_posts(
+            "source-team", "19:source@thread.tacv2", [excluded_post]
+        )
+        ExceptionList(main.settings.exception_list_path).add("laceyl@mmoser.com")
+
+        response = self.client.post("/api/posts/msg-1/translations", json={"target_language": "zh-Hans"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("exception list", response.json()["detail"])
+        self.assertEqual(self.translation_calls, [])
+
     def test_translate_cached_post_defaults_body_when_request_body_is_omitted(self) -> None:
         PostCache(main.settings.post_cache_path).upsert_posts(
             "source-team",
@@ -964,6 +1013,35 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["status"], "attached_reference")
         self.assertEqual(response.json()["record"]["attachment_statuses"][0]["id"], attachment["id"])
         self.assertEqual(self.graph.file_api_calls, [])
+
+    def test_create_repost_blocks_excluded_cached_sender_without_email(self) -> None:
+        excluded_post = {
+            **self._cached_post("msg-1", "2026-06-01T01:02:03Z"),
+            "author": "LaceyLi - M Moser Associates",
+            "author_email": None,
+            "translations": {
+                "zh-Hans": {
+                    "subject": "Saved",
+                    "body_html": "<p>Saved</p>",
+                    "body_preview": "Saved",
+                }
+            },
+        }
+        PostCache(main.settings.post_cache_path).upsert_posts(
+            "source-team", "19:source@thread.tacv2", [excluded_post]
+        )
+        ExceptionList(main.settings.exception_list_path).add("laceyl@mmoser.com")
+
+        response = self.client.post("/api/reposts", json={"source_message_id": "msg-1"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("exception list", response.json()["detail"])
+        self.assertEqual(self.graph.created_payloads, [])
+        self.assertIsNone(
+            RepostHistory(main.settings.repost_history_path).get(
+                "source-team", "19:source@thread.tacv2", "msg-1", "zh-Hans"
+            )
+        )
 
     def test_create_repost_omits_announcement_banner_attachment_as_regular_post(self) -> None:
         announcement_attachment = {

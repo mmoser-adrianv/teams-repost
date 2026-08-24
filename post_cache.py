@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class PostCache:
@@ -72,11 +72,14 @@ class PostCache:
         excluded_author_emails: set[str] | None = None,
         excluded_body_prefixes: tuple[str, ...] = (),
         exclude_unpresentable: bool = True,
+        excluded_author_matcher: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         posts = self.list_posts(source_team_id, source_channel_id)
         if exclude_unpresentable:
             posts = [post for post in posts if is_presentable_post(post)]
-        if excluded_author_emails:
+        if excluded_author_matcher:
+            posts = [post for post in posts if not excluded_author_matcher(post)]
+        elif excluded_author_emails:
             posts = [post for post in posts if (post.get("author_email") or "").lower() not in excluded_author_emails]
         if excluded_body_prefixes:
             posts = [post for post in posts if not _cached_body_text(post).startswith(excluded_body_prefixes)]

@@ -481,18 +481,19 @@ class ReplySyncService:
                 created = await graph.create_reply(
                     destination["team_id"], destination["channel_id"], destination["message_id"], payload
                 )
+                completion_status = "degraded" if fidelity.get("degraded") else "sent"
                 completion = self._record_completion(
                     thread,
                     reply,
                     int(item.get("sequence") or 0),
                     created,
-                    "sent",
+                    completion_status,
                     fidelity,
                 )
                 self.return_queue.mark(
                     thread_key,
                     reply_id,
-                    "sent",
+                    completion_status,
                     completed_at=completion["completed_at"],
                     destination_reply_id=completion.get("destination_reply_id"),
                 )
@@ -500,7 +501,7 @@ class ReplySyncService:
                 return {
                     "thread_key": thread_key,
                     "source_reply_id": reply_id,
-                    "status": "sent",
+                    "status": completion_status,
                     "sent": 1,
                     "recovered": recovered,
                     "sent_at": sent_at,

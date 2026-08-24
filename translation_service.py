@@ -9,6 +9,7 @@ from typing import Any
 
 VISIBLE_TEXT_SKIP_TAGS = {"script", "style", "noscript"}
 TAG_NAME_RE = re.compile(r"^<\s*(/)?\s*([a-zA-Z][\w:.-]*)")
+MAX_TRANSLATION_SEGMENTS_PER_REQUEST = 12
 
 
 class TranslationError(Exception):
@@ -103,6 +104,25 @@ class OpenAITranslationService:
         }
 
     async def _translate_segments(self, segments: list[str], target_language: str) -> list[str]:
+        translated: list[str] = []
+        for start in range(0, len(segments), MAX_TRANSLATION_SEGMENTS_PER_REQUEST):
+            batch = segments[start : start + MAX_TRANSLATION_SEGMENTS_PER_REQUEST]
+            translated.extend(await self._translate_batch(batch, target_language))
+        return translated
+
+    async def _translate_batch(self, segments: list[str], target_language: str) -> list[str]:
+        response = await self._request_translation(segments, target_language)
+        try:
+            return _parse_translation_array(_response_output_text(response), len(segments))
+        except TranslationError:
+            if len(segments) == 1:
+                raise
+            midpoint = len(segments) // 2
+            left = await self._translate_batch(segments[:midpoint], target_language)
+            right = await self._translate_batch(segments[midpoint:], target_language)
+            return left + right
+
+    async def _request_translation(self, segments: list[str], target_language: str) -> Any:
         try:
             response = await self._client().responses.create(
                 model=self.model,
@@ -127,7 +147,7 @@ class OpenAITranslationService:
             )
         except Exception as exc:
             raise TranslationError(f"OpenAI translation request failed: {exc}") from exc
-        return _parse_translation_array(_response_output_text(response), len(segments))
+        return response
 
     def _client(self) -> Any:
         if self.client is not None:

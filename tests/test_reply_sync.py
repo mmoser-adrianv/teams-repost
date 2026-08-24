@@ -492,6 +492,34 @@ class ReplySyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://teams.example/source/1", graph.created[0]["body"]["content"])
         self.assertIn("https://teams.example/source/2", graph.created[1]["body"]["content"])
 
+    async def test_gif_reply_is_sent_degraded_and_does_not_block_later_reply(self) -> None:
+        graph = FakeReplyGraph(
+            [
+                source_reply(
+                    "1",
+                    "2026-07-13T00:00:01Z",
+                    body='<p>Body 1<img src="../hostedContents/image-1/$value"></p>',
+                ),
+                source_reply("2", "2026-07-13T00:00:02Z"),
+            ]
+        )
+        graph.hosted["image-1"] = (b"gif", "image/gif")
+        self.service.activate(self.thread_key, "backfill_all")
+        await self.service.run_thread(self.thread_key, graph)
+
+        degraded = await self.service.run_thread(self.thread_key, graph)
+        self.allow_next_send()
+        continued = await self.service.run_thread(self.thread_key, graph)
+
+        self.assertEqual(degraded["dispatch_status"], "degraded")
+        self.assertEqual(degraded["sent"], 1)
+        self.assertEqual(continued["sent"], 1)
+        self.assertEqual(self.service.history.get(self.thread_key, "1")["status"], "degraded")
+        self.assertNotIn("hostedContents", graph.created[0])
+        self.assertIn("Microsoft Graph does not accept image/gif", graph.created[0]["body"]["content"])
+        self.assertIn("https://teams.example/source/1", graph.created[0]["body"]["content"])
+        self.assertIn("https://teams.example/source/2", graph.created[1]["body"]["content"])
+
     async def test_graph_create_failure_keeps_head_of_line_blocked(self) -> None:
         graph = FakeReplyGraph([source_reply("1", "2026-07-13T00:00:01Z"), source_reply("2", "2026-07-13T00:00:02Z")])
         graph.fail_create = True
@@ -917,14 +945,76 @@ class PayloadTests(unittest.TestCase):
         self.assertNotIn("reply-sync", payload["body"]["content"])
         self.assertFalse(fidelity["degraded"])
 
-    def test_unsupported_inline_type_blocks_full_fidelity(self) -> None:
+    def test_unsupported_inline_type_is_omitted_with_source_link(self) -> None:
         reply = {
             "id": "1",
+            "author": "Alex",
+            "web_url": "https://teams.example/source/1",
+            "target_language": "zh-Hans",
             "body_html": '<p><img src="../hostedContents/image-1/$value"></p>',
             "attachments": [],
         }
-        with self.assertRaises(ReplyFidelityError):
-            build_reply_payload(reply, {"body_html": reply["body_html"]}, {"image-1": (b"gif", "image/gif")})
+        payload, fidelity = build_reply_payload(
+            reply,
+            {"body_html": reply["body_html"]},
+            {"image-1": (b"gif", "image/gif")},
+        )
+
+        self.assertNotIn("hostedContents", payload)
+        self.assertIn("Microsoft Graph does not accept image/gif", payload["body"]["content"])
+        self.assertIn("https://teams.example/source/1", payload["body"]["content"])
+        self.assertTrue(fidelity["degraded"])
+        self.assertEqual(
+            fidelity["inline_image_statuses"][0]["status"],
+            "omitted_inline_unsupported_content_type",
+        )
+
+    def test_oversized_inline_image_is_omitted_to_fit_payload_budget(self) -> None:
+        reply = {
+            "id": "1",
+            "author": "Alex",
+            "web_url": "https://teams.example/source/1",
+            "target_language": "zh-Hans",
+            "body_html": '<p><img src="../hostedContents/image-1/$value"></p>',
+            "attachments": [],
+        }
+        payload, fidelity = build_reply_payload(
+            reply,
+            {"body_html": reply["body_html"]},
+            {"image-1": (b"x" * (3 * 1024 * 1024), "image/png")},
+        )
+
+        self.assertNotIn("hostedContents", payload)
+        self.assertIn("payload budget", payload["body"]["content"])
+        self.assertTrue(fidelity["degraded"])
+        self.assertEqual(fidelity["inline_image_statuses"][0]["status"], "omitted_inline_too_large")
+
+    def test_mixed_inline_images_preserve_supported_content(self) -> None:
+        reply = {
+            "id": "1",
+            "author": "Alex",
+            "web_url": "https://teams.example/source/1",
+            "target_language": "zh-Hans",
+            "body_html": (
+                '<p><img src="../hostedContents/image-1/$value">'
+                '<img src="../hostedContents/image-2/$value"></p>'
+            ),
+            "attachments": [],
+        }
+        payload, fidelity = build_reply_payload(
+            reply,
+            {"body_html": reply["body_html"]},
+            {
+                "image-1": (b"gif", "image/gif"),
+                "image-2": (b"png", "image/png"),
+            },
+        )
+
+        self.assertEqual(len(payload["hostedContents"]), 1)
+        self.assertEqual(payload["hostedContents"][0]["contentType"], "image/png")
+        self.assertIn('../hostedContents/2/$value', payload["body"]["content"])
+        self.assertIn("Microsoft Graph does not accept image/gif", payload["body"]["content"])
+        self.assertTrue(fidelity["degraded"])
 
     def test_degraded_payload_contains_source_links_without_native_media(self) -> None:
         reply = {

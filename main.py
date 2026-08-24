@@ -4,6 +4,7 @@ import base64
 import binascii
 import io
 import json
+import logging
 import re
 import zipfile
 from dataclasses import dataclass
@@ -49,11 +50,13 @@ from translation_service import TranslationConfigurationError, TranslationError,
 
 settings = get_settings()
 configure_logging()
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 CHINESE_REPOST_BODY_PREFIX = "原文作者："
 ENGLISH_REPOST_BODY_PREFIX = "Original author:"
 REPOST_BODY_PREFIXES = (CHINESE_REPOST_BODY_PREFIX, ENGLISH_REPOST_BODY_PREFIX)
+MISSING_EMBEDDED_IMAGE_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" width="320" height="64" viewBox="0 0 320 64" role="img" aria-label="Embedded image unavailable"><rect width="320" height="64" rx="6" fill="#f3f4f6"/><text x="160" y="37" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">Embedded image unavailable</text></svg>'''
 
 app = FastAPI(title="Teams Repost Graph POC", version="0.1.0")
 app.add_middleware(SessionMiddleware, secret_key=settings.session_secret, same_site="lax", https_only=False)
@@ -282,6 +285,7 @@ async def _translate_post_for_flow(
     post = cache.get_post(source.team_id, source.channel_id, source_message_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Cached post was not found")
+    _assert_post_not_excluded(flow, post)
     if not is_presentable_post(post):
         raise HTTPException(status_code=409, detail="Cached post has no presentable content to translate")
 
@@ -364,12 +368,30 @@ async def _download_embedded_image_for_flow(
     async with _graph(token) as graph:
         message = await graph.get_message(source.team_id, source.channel_id, source_message_id)
         ref = _hosted_image_ref(message, occurrence)
-        content, content_type = await graph.download_message_hosted_content(
-            source.team_id,
-            source.channel_id,
-            source_message_id,
-            ref.hosted_content_id,
-        )
+        try:
+            content, content_type = await graph.download_message_hosted_content(
+                source.team_id,
+                source.channel_id,
+                source_message_id,
+                ref.hosted_content_id,
+            )
+        except GraphAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            logger.warning(
+                "Embedded image is no longer available from Microsoft Graph",
+                extra={
+                    "flow": flow.name,
+                    "source_message_id": source_message_id,
+                    "occurrence": occurrence,
+                    "graph_status_code": exc.status_code,
+                },
+            )
+            return Response(
+                MISSING_EMBEDDED_IMAGE_SVG,
+                media_type="image/svg+xml",
+                headers={"Cache-Control": "no-store"},
+            )
     return Response(
         content,
         media_type=content_type,
@@ -481,7 +503,15 @@ async def _list_posts_for_flow(
             cache_meta["refresh_failed"] = True
             cache_meta["refresh_error"] = str(exc)
 
-    page = cache.page_posts(source.team_id, source.channel_id, offset, page_size, exception_emails, flow.skipped_body_prefixes)
+    page = cache.page_posts(
+        source.team_id,
+        source.channel_id,
+        offset,
+        page_size,
+        exception_emails,
+        flow.skipped_body_prefixes,
+        excluded_author_matcher=exceptions.matches_post,
+    )
     return {
         "flow": {
             "name": flow.name,
@@ -523,6 +553,7 @@ async def _create_repost_with_token(flow: RepostFlow, source_message_id: str, ta
     cached_post = cache.get_post(source.team_id, source.channel_id, source_message_id)
     if cached_post is None:
         raise HTTPException(status_code=404, detail="Cached post was not found")
+    _assert_post_not_excluded(flow, cached_post)
     if not is_presentable_post(cached_post):
         raise HTTPException(status_code=409, detail="Cached post has no presentable content to repost")
     translation = (cached_post.get("translations") or {}).get(target_language)
@@ -653,7 +684,7 @@ async def _refresh_post_cache(
                 if not _has_presentable_message_content(message):
                     posts_skipped_by_empty_content += 1
                     continue
-                if exceptions.contains(extract_author_email(message)):
+                if exceptions.matches_sender(extract_author_email(message), extract_author_display_name(message)):
                     posts_skipped_by_exception += 1
                     continue
                 new_posts.append(_cached_post_summary(message, image_route_prefix))
@@ -721,6 +752,7 @@ def _cached_post_summary(message: dict, image_route_prefix: str = "/api/posts") 
         "subject": message.get("subject"),
         "author": extract_author_display_name(message),
         "author_email": extract_author_email(message),
+        "author_id": extract_author_id(message),
         "created_date_time": message.get("createdDateTime"),
         "web_url": message.get("webUrl"),
         "body_html": _body_html(message, message_id, image_route_prefix),
@@ -806,6 +838,21 @@ def extract_author_email(message: dict) -> str | None:
         if normalized:
             return normalized
     return None
+
+
+def extract_author_id(message: dict) -> str | None:
+    sender = message.get("from") or {}
+    for container_key in ("user", "application", "conversation"):
+        container = sender.get(container_key) or {}
+        value = container.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _assert_post_not_excluded(flow: RepostFlow, post: dict) -> None:
+    if ExceptionList(flow.exception_list_path).matches_post(post):
+        raise HTTPException(status_code=409, detail="Post author is on this flow's exception list")
 
 
 def _body_html(message: dict, message_id: str, image_route_prefix: str = "/api/posts") -> str:
